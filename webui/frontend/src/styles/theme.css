@@ -1,0 +1,199 @@
+:root {
+  /* Light "paper / IDE" palette — warm cream + deep burnt orange accent */
+  --bg-base: #faf8f3;
+  --bg-panel: #f0ece1;
+  --bg-raised: #e6e0cf;
+  --bg-hover: #ddd6c2;
+
+  --fg-primary: #1c1a15;
+  --fg-secondary: #4a463c;
+  --fg-tertiary: #8a8474;
+
+  --accent: #b25e1f;
+  --accent-strong: #8a4413;
+  --accent-dim: #f3d9b8;
+  --ok: #1f6638;
+  --warn: #b25e1f;
+  --err: #b91c1c;
+
+  --border: #d4cdb9;
+  --border-strong: #b3aa92;
+
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html { overflow-x: hidden; }
+
+body {
+  overflow-x: hidden;
+  background: var(--bg-base);
+  color: var(--fg-primary);
+  font-family: var(--font-mono);
+  font-feature-settings: 'liga' 0, 'calt' 0;
+  position: relative;
+  min-height: 100vh;
+}
+
+::selection { background: var(--accent); color: #fff; }
+
+a { color: var(--accent-strong); text-decoration: underline; text-underline-offset: 2px; }
+a:hover { color: var(--accent); }
+
+/* Custom button class for [bracketed] terminal style */
+.term-btn {
+  background: transparent;
+  color: var(--accent-strong);
+  border: 1px solid var(--accent-strong);
+  padding: 8px 18px;
+  font: inherit;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  transition: all 60ms linear;
+  border-radius: 0;
+}
+.term-btn::before { content: '[ '; opacity: 0.6; }
+.term-btn::after { content: ' ]'; opacity: 0.6; }
+.term-btn:hover:not(:disabled) {
+  background: var(--accent-strong);
+  color: #fff;
+}
+.term-btn:disabled {
+  color: var(--fg-tertiary);
+  border-color: var(--border);
+  cursor: not-allowed;
+}
+.term-btn--ghost {
+  border-color: var(--border-strong);
+  color: var(--fg-secondary);
+}
+.term-btn--ghost:hover:not(:disabled) {
+  background: var(--bg-raised);
+  color: var(--fg-primary);
+  border-color: var(--fg-secondary);
+}
+
+/* Terminal blinking cursor */
+@keyframes term-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+.term-cursor {
+  display: inline-block;
+  width: 0.6em;
+  height: 1em;
+  background: var(--accent);
+  vertical-align: text-bottom;
+  animation: term-blink 1s step-end infinite;
+  margin-left: 4px;
+}
+
+/* Section divider — comment-style */
+.term-divider {
+  color: var(--fg-tertiary);
+  font-size: 12px;
+  margin: 24px 0 16px;
+  user-select: none;
+}
+.term-divider::before { content: '// '; color: var(--accent); }
+.term-divider::after { content: ' ' attr(data-tail); color: var(--border-strong); }
+
+/* Override Naive UI form input look */
+.n-input,
+.n-input .n-input__input-el,
+.n-input-number,
+.n-form-item-label {
+  font-family: var(--font-mono) !important;
+}
+
+/* ─── Shared step layout utilities ─────────────────────────────────── */
+.step-h { font-size: 26px; font-weight: 700; letter-spacing: 0.04em; margin: 4px 0 6px; color: var(--fg-primary); }
+.step-sub { color: var(--fg-secondary); font-size: 13px; margin: 0 0 22px; line-height: 1.6; }
+.step-actions { margin-top: 20px; display: flex; gap: 12px; flex-wrap: wrap; }
+
+.form-stack { display: flex; flex-direction: column; gap: 12px; max-width: 720px; }
+
+.tf-multi {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  border: 1px solid var(--border-strong);
+  background: #fff;
+  transition: border-color 80ms;
+}
+.tf-multi:focus-within { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.tf-multi > .tf-tag {
+  background: var(--bg-panel);
+  color: var(--fg-secondary);
+  padding: 10px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  border-right: 1px solid var(--border-strong);
+  display: flex;
+  align-items: flex-start;
+  text-transform: uppercase;
+}
+.tf-multi:focus-within > .tf-tag { color: var(--accent); }
+.tf-multi > textarea,
+.tf-multi > .tf-textarea-input {
+  background: transparent;
+  border: 0;
+  padding: 10px 12px;
+  color: var(--fg-primary);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+  resize: vertical;
+  min-height: 60px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.tf-multi > textarea::placeholder,
+.tf-multi > .tf-textarea-input::placeholder { color: var(--fg-tertiary); }
+
+/* Result / status block */
+.result-block { margin-top: 20px; border: 1px solid var(--border-strong); padding: 12px 14px; background: var(--bg-panel); animation: result-in 200ms ease-out; }
+.result-block.ok,  .result-block.result--ok  { border-color: var(--ok); background: #ebf5ee; }
+.result-block.fail,.result-block.result--fail { border-color: var(--err); background: #fbecec; }
+.result-block.warn,.result-block.result--warn { border-color: var(--warn); background: #fdf2e3; }
+.result-head { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--fg-primary); }
+.result-block.ok  .result-icon { color: var(--ok); }
+.result-block.fail .result-icon { color: var(--err); }
+.result-block.warn .result-icon { color: var(--warn); }
+.result-block.result--ok   .result-icon { color: var(--ok); }
+.result-block.result--fail .result-icon { color: var(--err); }
+.result-block.result--warn .result-icon { color: var(--warn); }
+.result-list { margin: 12px 0 0; padding: 0 0 0 24px; list-style: none; font-size: 12px; color: var(--fg-secondary); }
+.result-list li { padding: 3px 0; display: flex; gap: 12px; }
+.result-list li::before { content: '└─'; color: var(--fg-tertiary); }
+.row-name { font-weight: 700; min-width: 100px; color: var(--fg-primary); }
+.row-msg { color: var(--fg-secondary); }
+.row-ok .row-name { color: var(--ok); }
+.row-fail .row-name { color: var(--err); }
+.row-warn .row-name { color: var(--warn); }
+
+@keyframes result-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── Step 内容入场 stagger ─────────────────────────────────────────── */
+.step-fade-in > * {
+  opacity: 0;
+  animation: step-item-in 360ms ease-out forwards;
+}
+.step-fade-in > *:nth-child(1) { animation-delay: 0ms; }
+.step-fade-in > *:nth-child(2) { animation-delay: 60ms; }
+.step-fade-in > *:nth-child(3) { animation-delay: 120ms; }
+.step-fade-in > *:nth-child(4) { animation-delay: 180ms; }
+.step-fade-in > *:nth-child(5) { animation-delay: 240ms; }
+.step-fade-in > *:nth-child(6) { animation-delay: 300ms; }
+.step-fade-in > *:nth-child(7) { animation-delay: 360ms; }
+.step-fade-in > *:nth-child(8) { animation-delay: 420ms; }
+@keyframes step-item-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
