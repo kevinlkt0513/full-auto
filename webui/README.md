@@ -1,7 +1,5 @@
 # webui — 配置向导 + preflight 体检
 
-把 `pipeline.py` 第一次跑通的 1-3 小时配置过程压到 ~15 分钟。
-
 ## 快速开始
 
 ```bash

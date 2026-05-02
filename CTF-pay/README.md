@@ -1,5 +1,3 @@
-CTF 场景下当前协议主链，按真实抓包整理如下：
-
 - `init`
 - `elements/sessions`
 - `consumers/sessions/lookup`
