@@ -174,7 +174,9 @@ def _create_chatgpt_http_session(
 ) -> tuple[object, str]:
     proxy_url = _build_proxy_url_from_cfg(_resolve_proxy_cfg(cfg, proxy_cfg_override))
 
-    if _HAS_CURL_CFFI:
+    # 经验上 curl_cffi 走本地 HTTP 代理访问 chatgpt.com 时更容易触发
+    # TLS connect error；有代理时优先用 requests，稳定性更高。
+    if _HAS_CURL_CFFI and not proxy_url:
         http = CurlCffiSession(impersonate="chrome136")
         _apply_proxy_to_http_session(http, proxy_url)
         if user_agent:
@@ -229,6 +231,92 @@ def _http_session_stage_proxy(session_obj, stage_proxy_cfg: dict | None, stage_n
     finally:
         if hasattr(session_obj, "proxies"):
             session_obj.proxies = prev_proxies
+
+
+def _post_with_proxy_failover(session_obj, url: str, *, data=None, headers=None, timeout=None, retry_tag: str = ""):
+    """当本地代理瞬断时，临时直连重试一次，避免单步失败直接打断整条链路。"""
+    try:
+        return session_obj.post(url, data=data, headers=headers, timeout=timeout)
+    except requests.exceptions.ProxyError as e:
+        prev_proxies = dict(getattr(session_obj, "proxies", {}) or {})
+        if not any(prev_proxies.values()):
+            raise
+        tag = f"{retry_tag} " if retry_tag else ""
+        _log(f"      [proxy] {tag}代理异常，切直连重试 1 次: {e}")
+        _apply_proxy_to_http_session(session_obj, "")
+        try:
+            return session_obj.post(url, data=data, headers=headers, timeout=timeout)
+        finally:
+            if hasattr(session_obj, "proxies"):
+                session_obj.proxies = prev_proxies
+
+
+def _approve_chatgpt_checkout(cfg: dict, auth_cfg: dict, session_id: str, processor_entity: str):
+    access_token = (auth_cfg.get("access_token") or "").strip()
+    oai_device_id = (
+        auth_cfg.get("oai_device_id")
+        or auth_cfg.get("device_id")
+        or ""
+    ).strip()
+    cookie_header = (auth_cfg.get("cookie_header") or "").strip()
+    sentinel_token = (auth_cfg.get("openai_sentinel_token") or "").strip()
+
+    chatgpt_http_for_approve, _transport = _create_chatgpt_http_session(cfg)
+
+    # approve 前先做 sentinel/ping，刷新服务端会话状态；
+    # 否则 approve 返回 {"result":"exception"}（仿照 gopay.py 独立流程中的 _chatgpt_sentinel_ping）
+    _base_headers = {
+        "content-type": "application/json",
+        "accept": "*/*",
+        "authorization": f"Bearer {access_token}",
+        "origin": "https://chatgpt.com",
+        "referer": "https://chatgpt.com/",
+    }
+    if oai_device_id:
+        _base_headers["oai-device-id"] = oai_device_id
+    if cookie_header:
+        _base_headers["cookie"] = cookie_header
+    if sentinel_token:
+        _base_headers["openai-sentinel-token"] = sentinel_token
+    try:
+        chatgpt_http_for_approve.post(
+            "https://chatgpt.com/backend-api/sentinel/ping",
+            json={}, headers=_base_headers, timeout=15,
+        )
+        _log("      [manual_approval] sentinel/ping 完成")
+    except Exception as _ping_err:
+        _log(f"      [manual_approval] sentinel/ping 跳过: {_ping_err}")
+
+    approve_headers = {
+        **_base_headers,
+        "referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+        "x-openai-target-path": "/backend-api/payments/checkout/approve",
+        "x-openai-target-route": "/backend-api/payments/checkout/approve",
+    }
+    approve_body = {
+        "checkout_session_id": session_id,
+        "processor_entity": processor_entity,
+    }
+    ar = chatgpt_http_for_approve.post(
+        "https://chatgpt.com/backend-api/payments/checkout/approve",
+        json=approve_body,
+        headers=approve_headers,
+        timeout=20,
+    )
+    _log(f"      [manual_approval] ChatGPT approve: {ar.status_code} body={ar.text[:200]}")
+    if ar.status_code != 200:
+        raise RuntimeError(f"ChatGPT approve 失败: {ar.status_code} {ar.text[:200]}")
+    # 检查业务层结果（HTTP 200 但 result!=approved → token 过期或无效）
+    try:
+        ar_result = ar.json().get("result", "")
+    except Exception:
+        ar_result = ""
+    if ar_result != "approved":
+        raise RuntimeError(
+            f"ChatGPT approve 被拒绝 (result={ar_result!r})，"
+            "请检查 auth.access_token / cookie_header / openai_sentinel_token 是否有效"
+        )
+    return ar
 
 
 def _extract_api_error(resp) -> tuple[str, str]:
@@ -692,7 +780,7 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-STRIPE_API = "https://api.stripe.com"
+STRIPE_API = "https://pay.openai.com"
 STRIPE_VERSION_FULL = "2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1"
 STRIPE_VERSION_BASE = "2025-03-31.basil"
 USER_AGENT = (
@@ -887,6 +975,14 @@ def _extract_payment_method_types(payload: dict) -> list[str]:
             return out
 
     return ["card"]
+
+
+def _with_payment_method_type(payment_method_types: list[str], payment_method_type: str) -> list[str]:
+    out = [pm for pm in (payment_method_types or []) if isinstance(pm, str) and pm]
+    if payment_method_type and payment_method_type not in out:
+        out.append(payment_method_type)
+    return out or ["card"]
+
 
 def _build_browser_fingerprint(locale_profile: dict) -> dict:
     """构建 RecordBrowserInfo 的完整设备指纹 payload"""
@@ -1145,12 +1241,47 @@ def _stripe_headers():
         "Origin": "https://js.stripe.com",
         "Referer": "https://js.stripe.com/",
     }
+
+
+def _extract_checkout_fragment(*texts: str) -> str:
+    for text in texts:
+        raw = str(text or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+        except Exception:
+            parsed = None
+        if parsed and parsed.fragment:
+            return parsed.fragment
+        match = re.search(r"(?:_secret_|#)(fid[^\s&#]+)", raw)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _build_openai_pay_url(session_id: str, source_url: str = "", client_secret: str = "") -> str:
+    query = ""
+    fragment = _extract_checkout_fragment(source_url, client_secret)
+    raw = str(source_url or "").strip()
+    if raw:
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+            query = parsed.query or ""
+        except Exception:
+            query = ""
+    return urllib.parse.urlunsplit(
+        ("https", "pay.openai.com", f"/c/pay/{session_id}", query, fragment)
+    )
+
+
 def parse_checkout_url(raw: str) -> tuple[str, str]:
     """解析输入，返回 (session_id, stripe_checkout_url)
 
     支持以下格式:
       - 裸 session_id: cs_live_xxx / cs_test_xxx
       - Stripe URL: https://checkout.stripe.com/c/pay/cs_live_xxx
+      - OpenAI Pay URL: https://pay.openai.com/c/pay/cs_live_xxx  (当前主域名)
       - ChatGPT URL: https://chatgpt.com/checkout/openai_llc/cs_live_xxx
     """
     raw = raw.strip()
@@ -1160,11 +1291,13 @@ def parse_checkout_url(raw: str) -> tuple[str, str]:
     session_id = m.group(1)
 
     # 构建用于 Playwright 等回退方案的 Stripe checkout URL
-    # 如果输入是 checkout.stripe.com 的链接则直接使用，否则用标准格式构建
-    if "checkout.stripe.com" in raw:
-        stripe_url = raw
+    # pay.openai.com 是 OpenAI 当前使用的自定义 Stripe 结算域名（checkout.stripe.com 为旧域名）
+    if "pay.openai.com" in raw:
+        stripe_url = _build_openai_pay_url(session_id, source_url=raw)
+    elif "checkout.stripe.com" in raw:
+        stripe_url = _build_openai_pay_url(session_id, source_url=raw)
     else:
-        stripe_url = f"https://checkout.stripe.com/c/pay/{session_id}"
+        stripe_url = _build_openai_pay_url(session_id)
 
     return session_id, stripe_url
 
@@ -1651,6 +1784,7 @@ def _warm_chatgpt_checkout_context(
 def _extract_checkout_identifiers(data: dict) -> tuple[str, str, str]:
     cs_id = (data.get("checkout_session_id") or data.get("session_id") or "").strip()
     processor_entity = (data.get("processor_entity") or "").strip()
+    client_secret = (data.get("client_secret") or "").strip()
     checkout_url = (
         data.get("checkout_url")
         or data.get("url")
@@ -1663,7 +1797,7 @@ def _extract_checkout_identifiers(data: dict) -> tuple[str, str, str]:
         data.get("success_url", ""),
         data.get("cancel_url", ""),
         data.get("return_url", ""),
-        data.get("client_secret", ""),
+        client_secret,
     ]
 
     if not cs_id:
@@ -1684,8 +1818,12 @@ def _extract_checkout_identifiers(data: dict) -> tuple[str, str, str]:
             if m:
                 processor_entity = m.group(1)
 
-    if not checkout_url and cs_id and processor_entity:
-        checkout_url = f"https://chatgpt.com/checkout/{processor_entity}/{cs_id}"
+    if cs_id:
+        checkout_url = _build_openai_pay_url(
+            cs_id,
+            source_url=checkout_url,
+            client_secret=client_secret,
+        )
 
     return cs_id, processor_entity, checkout_url
 
@@ -1999,6 +2137,12 @@ def _build_fresh_checkout_body(fresh_cfg: dict, bootstrap: dict) -> dict:
         billing_details["currency"] = str(plan_cfg["billing_currency"]).upper()
     billing_details.setdefault("currency", "USD")
     base["billing_details"] = billing_details
+
+    processor_entity = plan_cfg.get("processor_entity", "")
+    if not processor_entity and billing_details.get("country", "US") != "US":
+        processor_entity = "openai_ie"
+    if processor_entity:
+        base["processor_entity"] = processor_entity
 
     base["cancel_url"] = plan_cfg.get("cancel_url") or base.get("cancel_url") or "https://chatgpt.com/#pricing"
     base["checkout_ui_mode"] = (
@@ -2442,14 +2586,16 @@ def generate_fresh_checkout(
                     ).upper()
                     processor_entity = "openai_llc" if billing_country == "US" else "openai_ie"
                 provider_url = fresh_url
+                # 使用 pay.openai.com（OpenAI 当前 Stripe 结算域名）作为主链接
+                canonical_pay_url = _build_openai_pay_url(
+                    session_id,
+                    source_url=provider_url,
+                )
                 canonical_chatgpt_url = (
                     f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
                     if processor_entity else ""
                 )
-                if canonical_chatgpt_url:
-                    fresh_url = canonical_chatgpt_url
-                elif not fresh_url and processor_entity:
-                    fresh_url = canonical_chatgpt_url
+                fresh_url = canonical_pay_url
 
                 _log(f"      [fresh] session_id: {session_id}")
                 if provider_url and provider_url != fresh_url:
@@ -2496,6 +2642,16 @@ def generate_fresh_checkout(
                     except Exception as e:
                         _log(f"      [fresh] route data warmup 异常: {e}")
 
+                # _auth 携带本次实际使用的 auth 凭证（auto_register 场景下是新账号的 token），
+                # 供调用方（run）更新 cfg，确保 approve 等后续 ChatGPT 调用使用同一账号。
+                _used_auth = dict(auth_cfg)
+                _used_auth["access_token"] = access_token
+                _used_auth["cookie_header"] = cookie_header
+                _used_auth["oai_device_id"] = oai_device_id
+                # sentinel_token 在 modern 分支内被刷新，必须回传给 approve
+                _st = locals().get("sentinel_token") or ""
+                if _st:
+                    _used_auth["openai_sentinel_token"] = _st
                 return {
                     "url": fresh_url,
                     "checkout_session_id": session_id,
@@ -2504,6 +2660,7 @@ def generate_fresh_checkout(
                     "client_secret": data.get("client_secret", ""),
                     "coupon_check": coupon_check,
                     "raw": data,
+                    "_auth": _used_auth,
                 }
 
             errors.append(f"{label} 返回 200 但未提取到 checkout_session_id: {json.dumps(data, ensure_ascii=False)[:400]}")
@@ -3052,6 +3209,22 @@ def update_payment_page_address(
 
         if resp.status_code != 200:
             _log(f"      [address] step {step_idx + 1} 返回 {resp.status_code}, 继续 ...")
+        else:
+            try:
+                address_data = resp.json()
+                updated_due = (
+                    (address_data.get("total_summary") or {}).get("due")
+                    if (address_data.get("total_summary") or {}).get("due") is not None
+                    else (address_data.get("invoice") or {}).get("amount_due")
+                )
+                if updated_due is not None and updated_due != ctx.get("checkout_amount"):
+                    ctx["checkout_amount"] = updated_due
+                    _log(f"      [address] 更新 expected_amount: {updated_due}")
+                updated_types = _extract_payment_method_types(address_data)
+                if updated_types and "gopay" in (ctx.get("payment_method_types") or []):
+                    ctx["payment_method_types"] = _with_payment_method_type(updated_types, "gopay")
+            except Exception as e:
+                _log(f"      [address] 解析地址更新响应失败，继续: {e}")
 
         # 模拟人类输入间隔 (2-5 秒)
         time.sleep(random.uniform(2.0, 4.5))
@@ -4264,7 +4437,9 @@ def create_payment_method(
     url = f"{STRIPE_API}/v1/payment_methods"
     _log("[4/6] 创建支付方式 (payment_method) ...")
     _log_request("POST", url, data=data, tag="[4/6] create_payment_method")
-    resp = session.post(url, data=data, headers=_stripe_headers())
+    resp = _post_with_proxy_failover(
+        session, url, data=data, headers=_stripe_headers(), retry_tag="create_payment_method"
+    )
     _log_response(resp, tag="[4/6] create_payment_method")
     if resp.status_code != 200:
         raise RuntimeError(f"创建 payment_method 失败 [{resp.status_code}]: {resp.text[:500]}")
@@ -4341,7 +4516,9 @@ def create_paypal_payment_method(
     url = f"{STRIPE_API}/v1/payment_methods"
     _log("[4/6] 创建 PayPal 支付方式 (payment_method type=paypal) ...")
     _log_request("POST", url, data=data, tag="[4/6] create_paypal_payment_method")
-    resp = session.post(url, data=data, headers=_stripe_headers())
+    resp = _post_with_proxy_failover(
+        session, url, data=data, headers=_stripe_headers(), retry_tag="create_paypal_payment_method"
+    )
     _log_response(resp, tag="[4/6] create_paypal_payment_method")
     if resp.status_code != 200:
         raise RuntimeError(f"创建 PayPal payment_method 失败 [{resp.status_code}]: {resp.text[:500]}")
@@ -4453,7 +4630,9 @@ def create_gopay_payment_method(
     url = f"{STRIPE_API}/v1/payment_methods"
     _log("[4/6] 创建 GoPay 支付方式 (payment_method type=gopay) ...")
     _log_request("POST", url, data=data, tag="[4/6] create_gopay_payment_method")
-    resp = session.post(url, data=data, headers=_stripe_headers())
+    resp = _post_with_proxy_failover(
+        session, url, data=data, headers=_stripe_headers(), retry_tag="create_gopay_payment_method"
+    )
     _log_response(resp, tag="[4/6] create_gopay_payment_method")
     if resp.status_code != 200:
         raise RuntimeError(f"创建 GoPay payment_method 失败 [{resp.status_code}]: {resp.text[:500]}")
@@ -6696,10 +6875,12 @@ def confirm_payment(
     )
     confirm_mode = ctx.get("confirm_mode", "inline_payment_method_data")
 
-    # 优先从 total_summary.due 获取金额（最准确）
+    # 地址更新后税费可能改变总额；ctx.checkout_amount 是最新值。
     expected_amount = "0"
     total_summary = init_resp.get("total_summary", {})
-    if total_summary.get("due") is not None:
+    if ctx.get("checkout_amount") is not None:
+        expected_amount = str(ctx["checkout_amount"])
+    elif total_summary.get("due") is not None:
         expected_amount = str(total_summary["due"])
     elif init_resp.get("invoice", {}).get("amount_due") is not None:
         expected_amount = str(init_resp["invoice"]["amount_due"])
@@ -6743,6 +6924,8 @@ def confirm_payment(
                 parsed_hosted.fragment,
             )
         )
+    if checkout_url:
+        checkout_url = _build_openai_pay_url(session_id, source_url=checkout_url)
 
 
     ver = STRIPE_VERSION_FULL
@@ -6793,10 +6976,13 @@ def confirm_payment(
 
     data.update(ctx.get("elements_options_client") or _elements_options_client_payload())
 
-    if ctx.get("js_checksum"):
-        data["js_checksum"] = ctx["js_checksum"]
-    if ctx.get("rv_timestamp"):
-        data["rv_timestamp"] = ctx["rv_timestamp"]
+    _js_ck = ctx.get("js_checksum") or ""
+    _rv_ts = ctx.get("rv_timestamp") or ""
+    # 跳过未填充的占位符（如 "FILL_FROM_CURRENT_STRIPE_CHECKOUT"）
+    if _js_ck and not _js_ck.upper().startswith("FILL"):
+        data["js_checksum"] = _js_ck
+    if _rv_ts and not _rv_ts.upper().startswith("FILL"):
+        data["rv_timestamp"] = _rv_ts
 
   
     if captcha_token:
@@ -6821,6 +7007,37 @@ def confirm_payment(
     _log_request("POST", url, data=data, tag="[5/6] confirm")
     resp = session.post(url, data=data, headers=_stripe_headers())
     _log_response(resp, tag="[5/6] confirm")
+    if resp.status_code == 400:
+        try:
+            err_data = resp.json().get("error", {})
+        except Exception:
+            err_data = {}
+        err_param = str(err_data.get("param") or "").strip()
+        err_pm_type = (err_data.get("extra_fields") or {}).get("payment_method_type", "")
+        requires_manual_approval = bool(init_resp.get("requires_manual_approval"))
+        # GoPay flow 天然需要先 approve 再 confirm（参见 gopay.py standalone 流程），
+        # 即使 init_resp 未显式设置 requires_manual_approval，也应尝试 approve→retry。
+        is_gopay_pm_error = (
+            err_param == "payment_method"
+            and (err_pm_type == "gopay" or ctx.get("payment_method_type") == "gopay")
+        )
+        if (
+            confirm_mode != "inline_payment_method_data"
+            and err_param == "payment_method"
+            and (requires_manual_approval or is_gopay_pm_error)
+        ):
+            _log("      [manual_approval] confirm 命中 payment_method 400，先走 ChatGPT approve 后重试 confirm 1 次 ...")
+            fresh_cfg = ctx.get("cfg") or {}
+            auth_cfg = ((fresh_cfg.get("fresh_checkout") or {}).get("auth") or {})
+            processor_entity = (
+                ctx.get("processor_entity")
+                or init_resp.get("processor_entity")
+                or "openai_llc"
+            )
+            _approve_chatgpt_checkout(fresh_cfg, auth_cfg, session_id, processor_entity)
+            _log_request("POST", url, data=data, tag="[5/6] confirm(retry_after_approve)")
+            resp = session.post(url, data=data, headers=_stripe_headers())
+            _log_response(resp, tag="[5/6] confirm(retry_after_approve)")
     if (
         resp.status_code == 400
         and "consent[terms_of_service]" not in data
@@ -8065,6 +8282,12 @@ def run(
     if _should_generate_fresh_checkout(checkout_input, force_fresh):
         fresh_info = generate_fresh_checkout(http, cfg, locale_profile=locale_profile)
         effective_checkout_input = fresh_info["url"]
+        # 用 fresh_info 里实际使用的 auth 更新 cfg，确保 approve 等后续 ChatGPT 调用
+        # 使用同一账号的 token（auto_register 场景下原始 cfg.auth 全是空字符串）
+        if fresh_info.get("_auth"):
+            import copy as _copy
+            cfg = _copy.deepcopy(cfg)
+            cfg.setdefault("fresh_checkout", {}).setdefault("auth", {}).update(fresh_info["_auth"])
         if fresh_only:
             _log(f"\n日志已保存到: {LOG_FILE}")
             print(fresh_info["url"])
@@ -8153,6 +8376,10 @@ def run(
     elif use_gopay:
         init_ctx["confirm_mode"] = "shared_payment_method"
         init_ctx["payment_method_type"] = "gopay"
+        init_ctx["payment_method_types"] = _with_payment_method_type(
+            init_ctx.get("payment_method_types") or ["card"],
+            "gopay",
+        )
     else:
         init_ctx["confirm_mode"] = runtime_cfg.get("confirm_mode", "inline_payment_method_data")
     # 把 processor_entity 透传给 manual_approval 阶段；默认 openai_llc（IDR/Plus 用）
@@ -8171,6 +8398,7 @@ def run(
         init_ctx["proxy_url"] = _build_proxy_url_from_cfg(proxy_cfg)
     init_ctx["captcha_api_key"] = captcha_cfg.get("api_key", "")
     init_ctx["stage_proxies"] = stage_proxy_cfg
+    init_ctx["cfg"] = cfg
     effective_external_solver_cfg = dict(browser_challenge_cfg.get("external_solver") or {})
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     should_autofill_external_solver = (
@@ -8258,6 +8486,11 @@ def run(
     with _http_session_stage_proxy(http, stage_proxy_cfg, "elements"):
         elements_resp = fetch_elements_session(
             http, pk, session_id, init_ctx, stripe_ver=stripe_ver, locale_profile=locale_profile
+        )
+    if use_gopay and "gopay" not in (init_ctx.get("payment_method_types") or []):
+        raise RuntimeError(
+            "当前 Stripe Elements 配置未返回 GoPay 支付方式；"
+            "无法生成 GoPay redirect 长链接。"
         )
 
    
@@ -8396,43 +8629,11 @@ def run(
                     try:
                         fresh_cfg = cfg.get("fresh_checkout") or {}
                         auth_cfg = fresh_cfg.get("auth") or {}
-                        access_token = (auth_cfg.get("access_token") or "").strip()
-                        oai_device_id = (
-                            auth_cfg.get("oai_device_id")
-                            or auth_cfg.get("device_id")
-                            or ""
-                        ).strip()
-                        cookie_header = (auth_cfg.get("cookie_header") or "").strip()
                         processor_entity = init_ctx.get("processor_entity") or "openai_ie"
                         # 推断: processor_entity 可能在 init_resp 或 fresh_info
                         if not processor_entity:
                             processor_entity = init_resp.get("merchant_of_record_country", "openai_ie")
-                        approve_headers = {
-                            "content-type": "application/json",
-                            "accept": "*/*",
-                            "authorization": f"Bearer {access_token}",
-                            "origin": "https://chatgpt.com",
-                            "referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
-                            "x-openai-target-path": "/backend-api/payments/checkout/approve",
-                            "x-openai-target-route": "/backend-api/payments/checkout/approve",
-                        }
-                        if oai_device_id:
-                            approve_headers["oai-device-id"] = oai_device_id
-                        if isinstance(cookie_header, str) and cookie_header:
-                            approve_headers["cookie"] = cookie_header
-                        approve_body = {
-                            "checkout_session_id": session_id,
-                            "processor_entity": processor_entity,
-                        }
-                        # 创建独立 HTTP session 走 ChatGPT 代理
-                        chatgpt_http_for_approve, _transport = _create_chatgpt_http_session(cfg)
-                        ar = chatgpt_http_for_approve.post(
-                            "https://chatgpt.com/backend-api/payments/checkout/approve",
-                            json=approve_body, headers=approve_headers, timeout=20,
-                        )
-                        _log(f"      [manual_approval] ChatGPT approve: {ar.status_code} body={ar.text[:200]}")
-                        if ar.status_code != 200:
-                            raise RuntimeError(f"ChatGPT approve 失败: {ar.status_code} {ar.text[:200]}")
+                        _approve_chatgpt_checkout(cfg, auth_cfg, session_id, processor_entity)
                     except Exception as e_ap:
                         _log(f"      [manual_approval] approve 异常: {e_ap}")
                         raise
@@ -8449,7 +8650,7 @@ def run(
                     got_redirect = False
                     for poll_i in range(15):
                         gr = http.get(
-                            f"https://api.stripe.com/v1/payment_pages/{session_id}",
+                            f"{STRIPE_API}/v1/payment_pages/{session_id}",
                             params=get_params, timeout=20,
                         )
                         if gr.status_code != 200:

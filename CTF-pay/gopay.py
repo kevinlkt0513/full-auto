@@ -196,7 +196,7 @@ class GoPayCharger:
             "key": stripe_pk,
         }
         r = self.ext.post(
-            "https://api.stripe.com/v1/payment_methods",
+            "https://pay.openai.com/v1/payment_methods",
             data=body, timeout=DEFAULT_TIMEOUT,
         )
         r.raise_for_status()
@@ -222,7 +222,7 @@ class GoPayCharger:
             "key": stripe_pk,
         }
         r = self.ext.post(
-            f"https://api.stripe.com/v1/payment_pages/{cs_id}/init",
+            f"https://pay.openai.com/v1/payment_pages/{cs_id}/init",
             data=body, timeout=DEFAULT_TIMEOUT,
         )
         r.raise_for_status()
@@ -240,7 +240,7 @@ class GoPayCharger:
         )
         from urllib.parse import quote
         return_url = (
-            f"https://checkout.stripe.com/c/pay/{cs_id}"
+            f"https://pay.openai.com/c/pay/{cs_id}"
             f"?returned_from_redirect=true&ui_mode=custom&return_url={quote(chatgpt_return, safe='')}"
         )
         body = {
@@ -270,7 +270,7 @@ class GoPayCharger:
         if self.runtime.get("rv_timestamp"):
             body["rv_timestamp"] = self.runtime["rv_timestamp"]
         r = self.ext.post(
-            f"https://api.stripe.com/v1/payment_pages/{cs_id}/confirm",
+            f"https://pay.openai.com/v1/payment_pages/{cs_id}/confirm",
             data=body, timeout=DEFAULT_TIMEOUT,
         )
         if r.status_code != 200:
@@ -336,7 +336,7 @@ class GoPayCharger:
         }
         while time.time() < deadline:
             r = self.ext.get(
-                f"https://api.stripe.com/v1/payment_pages/{cs_id}",
+                f"https://pay.openai.com/v1/payment_pages/{cs_id}",
                 params=params,
                 timeout=DEFAULT_TIMEOUT,
             )

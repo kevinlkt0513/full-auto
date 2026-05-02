@@ -59,6 +59,14 @@ def _build_pkce_pair(raw_bytes: int = 64) -> tuple[str, str]:
     return verifier, challenge
 
 
+def _allow_numeric_otp_fallback(page_url: str) -> bool:
+    """Only treat a generic numeric input as OTP on explicit verification pages."""
+    url = (page_url or "").lower()
+    if "about-you" in url:
+        return False
+    return "email-verification" in url or "otp" in url
+
+
 def _parse_proxy(proxy_url: str):
     """Camoufox 需要 socks5 + 无 auth 的格式。socks5 + auth 需要走 gost 中继。"""
     if not proxy_url:
@@ -134,6 +142,154 @@ def browser_register(cfg, mail_provider) -> dict:
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
+            def _find_otp_inputs():
+                single = page.query_selector('input[autocomplete="one-time-code"]') or \
+                         page.query_selector('input[name="code"]') or \
+                         page.query_selector('input[id*="code" i]') or \
+                         page.query_selector('input[name*="otp" i]')
+                if not single and _allow_numeric_otp_fallback(page.url):
+                    single = page.query_selector(
+                        'input[inputmode="numeric"][maxlength="6"], '
+                        'input[inputmode="numeric"][minlength="6"], '
+                        'input[inputmode="numeric"][aria-label*="code" i], '
+                        'input[inputmode="numeric"][placeholder*="code" i], '
+                        'input[inputmode="numeric"]:not([maxlength="1"])'
+                    )
+                digits = []
+                if not single:
+                    digits = page.query_selector_all('input[maxlength="1"][inputmode="numeric"]') or \
+                             page.query_selector_all('input[maxlength="1"]')
+                return single, digits
+
+            def _has_otp_inputs() -> bool:
+                single, digits = _find_otp_inputs()
+                return bool(single or len(digits) >= 6)
+
+            def _submit_visible_continue(context_label: str) -> bool:
+                for sel in ['button[type="submit"]', 'button:has-text("Continue")',
+                            'button:has-text("Verify")', 'button:has-text("Next")']:
+                    b = page.query_selector(sel)
+                    if b and b.is_visible():
+                        b.click()
+                        logger.info(f"[browser-reg] 点击 {context_label} 继续: {sel}")
+                        return True
+                return False
+
+            def _fill_otp_if_present(context_label: str, issued_after: float | None = None) -> bool:
+                single, digits = _find_otp_inputs()
+                if not single and len(digits) < 6:
+                    return False
+
+                logger.info(f"[browser-reg] {context_label}: 等待 IMAP OTP ...")
+                try:
+                    otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
+                except Exception:
+                    otp_timeout = 180
+                otp_code = mail_provider.wait_for_otp(
+                    email,
+                    timeout=otp_timeout,
+                    issued_after=issued_after or (time.time() - 300),
+                )
+                logger.info(f"[browser-reg] {context_label}: 收到 OTP: {otp_code}")
+
+                otp_filled = False
+                if single:
+                    single.click()
+                    time.sleep(0.3)
+                    single.fill(otp_code)
+                    otp_filled = True
+                else:
+                    for i, ch in enumerate(otp_code[:6]):
+                        digits[i].click()
+                        time.sleep(0.1)
+                        digits[i].fill(ch)
+                    otp_filled = True
+
+                if not otp_filled:
+                    page.screenshot(path=f"/tmp/browser_reg_{context_label}_otp_fail.png")
+                    raise RuntimeError("OTP 输入框未找到")
+                time.sleep(0.8)
+                _submit_visible_continue(context_label)
+                time.sleep(4)
+                return True
+
+            def _retry_current_otp_submit(context_label: str) -> bool:
+                if not _has_otp_inputs():
+                    return False
+                try:
+                    if _submit_visible_continue(context_label):
+                        time.sleep(4)
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            email_selector = 'input[type="email"], input[name="email"], input[autocomplete="email"]'
+
+            def _has_email_input() -> bool:
+                try:
+                    return bool(page.query_selector(email_selector))
+                except Exception:
+                    return False
+
+            def _goto_real_auth_signup() -> bool:
+                """用 ChatGPT 自己的 signin 接口拿 OAuth URL，避免首页按钮点击不生效。"""
+                try:
+                    auth_url = page.evaluate('''async () => {
+                        const csrfResp = await fetch("/api/auth/csrf", {credentials: "include"});
+                        const csrfJson = await csrfResp.json();
+                        const csrfToken = csrfJson && csrfJson.csrfToken;
+                        if (!csrfToken) return "";
+                        const body = new URLSearchParams({
+                            csrfToken,
+                            callbackUrl: "https://chatgpt.com/",
+                            json: "true",
+                        });
+                        const signinResp = await fetch("/api/auth/signin/openai", {
+                            method: "POST",
+                            credentials: "include",
+                            headers: {"content-type": "application/x-www-form-urlencoded"},
+                            body,
+                        });
+                        const signinJson = await signinResp.json();
+                        return signinJson && signinJson.url || "";
+                    }''')
+                except Exception as e:
+                    logger.warning(f"[browser-reg] 获取真实 auth URL 失败: {e}")
+                    auth_url = ""
+
+                if auth_url:
+                    if "screen_hint=" not in auth_url:
+                        auth_url += ("&" if "?" in auth_url else "?") + "screen_hint=signup"
+                    logger.info(f"[browser-reg] 使用真实 auth URL 兜底: {auth_url[:100]}")
+                    page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(3)
+                    if _has_email_input():
+                        return True
+
+                for url in (
+                    "https://chatgpt.com/auth/signup",
+                    "https://chatgpt.com/auth/login",
+                    "https://auth.openai.com/create-account",
+                ):
+                    try:
+                        logger.info(f"[browser-reg] 注册入口兜底跳转: {url}")
+                        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        time.sleep(3)
+                        if _has_email_input():
+                            return True
+                        for sel in ['a:has-text("Sign up")', 'button:has-text("Sign up")',
+                                    'a:has-text("Create account")', 'button:has-text("Create account")']:
+                            b = page.query_selector(sel)
+                            if b and b.is_visible():
+                                b.click(timeout=5000)
+                                time.sleep(3)
+                                if _has_email_input():
+                                    return True
+                    except Exception as e:
+                        logger.warning(f"[browser-reg] 注册入口兜底失败 {url}: {e}")
+                return False
+
             # [1] 打开 ChatGPT 首页，点 "Sign up for free"
             logger.info("[browser-reg] 打开 ChatGPT 首页 ...")
             page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
@@ -187,7 +343,7 @@ def browser_register(cfg, mail_provider) -> dict:
             pre_url = page.url
             for i in range(20):
                 time.sleep(1)
-                if "auth.openai.com" in page.url or page.query_selector('input[type="email"]'):
+                if "auth.openai.com" in page.url or _has_email_input():
                     break
                 # 如果 5s 后还没变化，重试点击 Sign up
                 if i == 5 and page.url == pre_url:
@@ -201,21 +357,33 @@ def browser_register(cfg, mail_provider) -> dict:
                             btn.evaluate("el => el.click()")
                         except Exception:
                             pass
+                if i == 10 and page.url == pre_url:
+                    logger.info("[browser-reg] Sign up 仍未跳转，改用真实 auth URL 兜底")
+                    if _goto_real_auth_signup():
+                        break
             logger.info(f"[browser-reg] 当前 URL: {page.url[:120]}")
             page.screenshot(path="/tmp/browser_reg_before_email.png")
 
             # [2] 填邮箱（click + fill 分步，React 重渲染可能让 handle 失效 → 每步重新 query）
             logger.info("[browser-reg] 填邮箱 ...")
-            page.wait_for_selector('input[type="email"], input[name="email"]', timeout=30000)
+            if not _has_email_input():
+                _goto_real_auth_signup()
+            try:
+                page.wait_for_selector(email_selector, timeout=30000)
+            except Exception as e:
+                page.screenshot(path="/tmp/browser_reg_email_timeout.png")
+                raise RuntimeError(f"等待邮箱输入框超时，当前 URL={page.url[:160]}") from e
             for _try in range(4):
                 try:
                     ei = page.query_selector('input[type="email"]') or \
-                         page.query_selector('input[name="email"]')
+                         page.query_selector('input[name="email"]') or \
+                         page.query_selector('input[autocomplete="email"]')
                     if not ei: time.sleep(0.5); continue
                     ei.click(timeout=5000)
                     time.sleep(0.3)
                     ei2 = page.query_selector('input[type="email"]') or \
-                          page.query_selector('input[name="email"]')
+                          page.query_selector('input[name="email"]') or \
+                          page.query_selector('input[autocomplete="email"]')
                     (ei2 or ei).fill(email)
                     break
                 except Exception as e:
@@ -267,9 +435,7 @@ def browser_register(cfg, mail_provider) -> dict:
                 time.sleep(1)
                 cur = page.url
                 # 到达 OTP 输入或继续步骤 → 通过
-                if page.query_selector('input[autocomplete="one-time-code"]') or \
-                   page.query_selector('input[name="code"]') or \
-                   page.query_selector('input[inputmode="numeric"]'):
+                if _has_otp_inputs():
                     logger.info(f"[browser-reg] 已到达 OTP 页面")
                     break
                 if "chatgpt.com" in cur and "auth.openai.com" not in cur:
@@ -280,49 +446,10 @@ def browser_register(cfg, mail_provider) -> dict:
                     logger.info(f"[browser-reg] 15s 等待中: {cur[:80]}")
 
             # [5] OTP 步骤
-            if page.query_selector('input[autocomplete="one-time-code"]') or \
-               page.query_selector('input[inputmode="numeric"]'):
-                logger.info("[browser-reg] 等待 IMAP OTP ...")
+            otp_completed = False
+            if _has_otp_inputs():
                 otp_sent_at = time.time()
-                try:
-                    otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
-                except Exception:
-                    otp_timeout = 180
-                otp_code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=otp_sent_at)
-                logger.info(f"[browser-reg] 收到 OTP: {otp_code}")
-                # 填 OTP
-                otp_filled = False
-                # 可能是单框 / 多框两种
-                single = page.query_selector('input[autocomplete="one-time-code"]') or \
-                         page.query_selector('input[name="code"]') or \
-                         page.query_selector('input[inputmode="numeric"]:not([maxlength="1"])')
-                if single:
-                    single.click()
-                    time.sleep(0.3)
-                    single.fill(otp_code)
-                    otp_filled = True
-                else:
-                    digits = page.query_selector_all('input[maxlength="1"][inputmode="numeric"]') or \
-                             page.query_selector_all('input[maxlength="1"]')
-                    if len(digits) >= 6:
-                        for i, ch in enumerate(otp_code[:6]):
-                            digits[i].click()
-                            time.sleep(0.1)
-                            digits[i].fill(ch)
-                        otp_filled = True
-                if not otp_filled:
-                    page.screenshot(path="/tmp/browser_reg_otp_fail.png")
-                    raise RuntimeError("OTP 输入框未找到")
-                time.sleep(0.8)
-                # Continue
-                for sel in ['button[type="submit"]', 'button:has-text("Continue")',
-                            'button:has-text("Verify")', 'button:has-text("Next")']:
-                    b = page.query_selector(sel)
-                    if b and b.is_visible():
-                        b.click()
-                        logger.info(f"[browser-reg] 点击 OTP 继续: {sel}")
-                        break
-                time.sleep(4)
+                otp_completed = _fill_otp_if_present("OTP", issued_after=otp_sent_at)
 
             # [6] /about-you：Full name + Age（单框）
             logger.info(f"[browser-reg] OTP 后 URL: {page.url[:120]}")
@@ -342,16 +469,31 @@ def browser_register(cfg, mail_provider) -> dict:
             def _enum_inputs():
                 try:
                     return page.evaluate('''() => {
-                        return Array.from(document.querySelectorAll('input')).map((el, idx) => {
+                        const selector = [
+                            'input',
+                            'textarea',
+                            '[contenteditable="true"]',
+                            '[role="textbox"]',
+                            '[role="combobox"]'
+                        ].join(',');
+                        return Array.from(document.querySelectorAll(selector)).map((el, idx) => {
                             const r = el.getBoundingClientRect();
                             const cs = getComputedStyle(el);
+                            const tag = (el.tagName || '').toLowerCase();
+                            const labelText = (el.labels && el.labels[0] && el.labels[0].innerText) || '';
+                            const parentText = (el.parentElement && el.parentElement.innerText) || '';
+                            const text = (el.innerText || el.textContent || '').trim();
                             return {
                                 idx,
+                                tag,
                                 type: (el.type || '').toLowerCase(),
                                 name: el.name || '',
                                 placeholder: el.placeholder || '',
                                 ariaLabel: el.getAttribute('aria-label') || '',
-                                label: (el.labels && el.labels[0] && el.labels[0].innerText) || '',
+                                label: labelText,
+                                parentText: parentText.slice(0, 120),
+                                text: text.slice(0, 120),
+                                contenteditable: el.getAttribute('contenteditable') || '',
                                 value: el.value || '',
                                 visible: (r.width > 0 && r.height > 0 &&
                                           cs.visibility !== 'hidden' && cs.display !== 'none'),
@@ -364,11 +506,21 @@ def browser_register(cfg, mail_provider) -> dict:
             def _is_birthday(meta: dict) -> bool:
                 blob = " ".join([meta.get("type",""), meta.get("name",""),
                                   meta.get("placeholder",""), meta.get("ariaLabel",""),
-                                  meta.get("label","")]).lower()
+                                  meta.get("label",""), meta.get("parentText",""),
+                                  meta.get("text","")]).lower()
                 if meta.get("type") == "date":
                     return True
-                return any(kw in blob for kw in ("birth", "birthday", "dob",
+                return any(kw in blob for kw in ("birth", "birthday", "dob", "date of birth",
                                                   "mm/dd/yyyy", "mm / dd / yyyy"))
+
+            def _is_full_name(meta: dict) -> bool:
+                blob = " ".join([meta.get("type",""), meta.get("name",""),
+                                  meta.get("placeholder",""), meta.get("ariaLabel",""),
+                                  meta.get("label",""), meta.get("parentText",""),
+                                  meta.get("text","")]).lower()
+                if any(kw in blob for kw in ("birthday", "birth", "dob", "age")):
+                    return False
+                return any(kw in blob for kw in ("full name", "name"))
 
             full_name_input = None
             birthday_input = None
@@ -380,11 +532,15 @@ def browser_register(cfg, mail_provider) -> dict:
                                                          "checkbox","radio","password")]
                 # 先挑 Birthday，剩下的看作 name
                 bd = next((m for m in visible_metas if _is_birthday(m)), None)
-                name_m = next((m for m in visible_metas
-                                if m is not bd
-                                and not _is_birthday(m)), None)
+                name_m = next((m for m in visible_metas if _is_full_name(m)), None)
+                if not name_m:
+                    name_m = next((m for m in visible_metas
+                                    if m is not bd
+                                    and not _is_birthday(m)), None)
                 if bd and name_m:
-                    all_inputs_el = page.query_selector_all('input')
+                    all_inputs_el = page.query_selector_all(
+                        'input, textarea, [contenteditable="true"], [role="textbox"], [role="combobox"]'
+                    )
                     full_name_input = all_inputs_el[name_m["idx"]]
                     birthday_input = all_inputs_el[bd["idx"]]
                     birthday_meta = bd
@@ -394,7 +550,9 @@ def browser_register(cfg, mail_provider) -> dict:
                     break
                 # 兼容老版 age：2 个 input 且都不匹配 birthday
                 if not bd and len(visible_metas) >= 2:
-                    all_inputs_el = page.query_selector_all('input')
+                    all_inputs_el = page.query_selector_all(
+                        'input, textarea, [contenteditable="true"], [role="textbox"], [role="combobox"]'
+                    )
                     full_name_input = all_inputs_el[visible_metas[0]["idx"]]
                     birthday_input = all_inputs_el[visible_metas[1]["idx"]]
                     birthday_meta = visible_metas[1]
@@ -407,6 +565,36 @@ def browser_register(cfg, mail_provider) -> dict:
                     logger.info(f"[browser-reg] 等待 about-you 输入框 5s, URL={page.url[:100]} "
                                 f"inputs visible={len(visible_metas)}")
                 time.sleep(1)
+
+            if not (full_name_input and birthday_input):
+                fallback_name_selectors = [
+                    'input[placeholder*="Full name" i]',
+                    'input[aria-label*="Full name" i]',
+                    'input[name*="name" i]',
+                    'textarea[placeholder*="Full name" i]',
+                    '[role="textbox"][aria-label*="Full name" i]',
+                ]
+                fallback_birthday_selectors = [
+                    'input[placeholder*="Birthday" i]',
+                    'input[aria-label*="Birthday" i]',
+                    'input[type="date"]',
+                    'input[name*="birth" i]',
+                    '[role="textbox"][aria-label*="Birthday" i]',
+                    '[role="combobox"][aria-label*="Birthday" i]',
+                ]
+                for sel in fallback_name_selectors:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        full_name_input = el
+                        break
+                for sel in fallback_birthday_selectors:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        birthday_input = el
+                        birthday_meta = birthday_meta or {"type": "date" if 'type="date"' in sel else "text"}
+                        break
+                if full_name_input and birthday_input:
+                    logger.info("[browser-reg] about-you 走 placeholder/aria fallback 命中")
 
             if full_name_input and birthday_input:
                 page.screenshot(path="/tmp/browser_reg_about_you.png")
@@ -426,7 +614,10 @@ def browser_register(cfg, mail_provider) -> dict:
                             f"Birthday={birthday_str} (legacy_age={legacy_age})")
                 try:
                     full_name_input.focus(); time.sleep(0.3)
-                    page.keyboard.type(full_name, delay=random.randint(30, 80))
+                    try:
+                        full_name_input.fill(full_name)
+                    except Exception:
+                        page.keyboard.type(full_name, delay=random.randint(30, 80))
                     time.sleep(random.uniform(0.4, 0.9))
                     birthday_input.focus(); time.sleep(0.3)
                     # 先清空（预填可能有今日日期）
@@ -444,9 +635,15 @@ def browser_register(cfg, mail_provider) -> dict:
                     else:
                         # MM/DD/YYYY：为兼容 age 老版，若看起来是 number/age 就只打 age
                         if _is_birthday(birthday_meta or {}):
-                            page.keyboard.type(birthday_str, delay=random.randint(30, 70))
+                            try:
+                                birthday_input.fill(birthday_str)
+                            except Exception:
+                                page.keyboard.type(birthday_str, delay=random.randint(30, 70))
                         else:
-                            page.keyboard.type(legacy_age, delay=random.randint(40, 100))
+                            try:
+                                birthday_input.fill(legacy_age)
+                            except Exception:
+                                page.keyboard.type(legacy_age, delay=random.randint(40, 100))
                     time.sleep(random.uniform(0.4, 0.9))
                     clicked = False
                     for sel in ['button:has-text("Finish")', 'button:has-text("Create")',
@@ -471,12 +668,25 @@ def browser_register(cfg, mail_provider) -> dict:
             logger.info("[browser-reg] 等待跳转回 chatgpt.com ...")
             arrived = False
             last_url = ""
+            stuck_email_verification_since = None
             for i in range(120):
                 time.sleep(1)
                 cur = page.url
                 if cur != last_url:
                     logger.info(f"[browser-reg] URL@{i}s: {cur[:120]}")
                     last_url = cur
+                if "email-verification" in cur and _has_otp_inputs() and otp_completed:
+                    if stuck_email_verification_since is None:
+                        stuck_email_verification_since = i
+                    if i - stuck_email_verification_since in (5, 15):
+                        logger.info("[browser-reg] OTP 后仍在 email-verification，重试提交当前页面")
+                        _retry_current_otp_submit("email-verification重试")
+                        continue
+                    if i - stuck_email_verification_since > 30:
+                        page.screenshot(path="/tmp/browser_reg_otp_stuck.png")
+                        raise RuntimeError(
+                            f"OTP 提交后仍停在 email-verification，当前: {page.url[:120]}"
+                        )
                 # 到 chatgpt.com 且已加载 React 主界面
                 if "chatgpt.com" in cur and "auth.openai.com" not in cur:
                     # 等 /api/auth/session 能正常返回 accessToken 才算完成
@@ -494,19 +704,23 @@ def browser_register(cfg, mail_provider) -> dict:
                             break
                     except Exception:
                         pass
+                # 某些注册变体会在 about-you 后再落到 /email-verification/register。
+                # 只有还没完成过 OTP 时才等待新码；已提交过 OTP 时避免空等第二封邮件。
+                if "auth.openai.com" in cur and _has_otp_inputs() and not otp_completed:
+                    try:
+                        if _fill_otp_if_present("final-email-verification"):
+                            otp_completed = True
+                            continue
+                    except Exception as e:
+                        logger.warning(f"[browser-reg] final-email-verification OTP 异常: {e}")
                 # 如果仍在 auth.openai.com，可能还有 /email-verification 或其他中转，继续点 continue
                 if "auth.openai.com" in cur and i % 10 == 5:
-                    for sel in ['button:has-text("Continue")', 'button:has-text("Next")',
-                                'button[type="submit"]']:
-                        try:
-                            b = page.query_selector(sel)
-                            if b and b.is_visible():
-                                b.click()
-                                logger.info(f"[browser-reg] 中转点击: {sel}")
-                                break
-                        except Exception:
-                            # 页面导航时 context destroyed，忽略
-                            pass
+                    try:
+                        if _submit_visible_continue("中转"):
+                            continue
+                    except Exception:
+                        # 页面导航时 context destroyed，忽略
+                        pass
             if not arrived:
                 page.screenshot(path="/tmp/browser_reg_no_chatgpt.png")
                 raise RuntimeError(f"未跳转回 chatgpt.com，当前: {page.url[:120]}")

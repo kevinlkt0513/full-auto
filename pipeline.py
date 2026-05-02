@@ -43,10 +43,6 @@ RESULTS_FILE = OUTPUT_DIR / "pipeline_batch.jsonl"
 CARD_RESULTS_FILE = OUTPUT_DIR / "results.jsonl"
 DOMAIN_STATE_FILE = OUTPUT_DIR / "email_domain_state.json"
 REGISTERED_ACCOUNTS_FILE = OUTPUT_DIR / "registered_accounts.jsonl"
-COCKPIT_PROJECT_DIR = Path(
-    os.environ.get("COCKPIT_TOOLS_DIR", "/Users/mac/Desktop/cockpit-tools-main")
-).expanduser()
-COCKPIT_IMPORT_FILE = COCKPIT_PROJECT_DIR / "imports" / "gpt_payment_success_codex_accounts.json"
 
 
 # ──────────────────────────────────────────────
@@ -778,112 +774,6 @@ def pay(card_config_path, session_token=None, access_token=None,
     return {"status": "unknown", "raw": None}
 
 
-def _iter_jsonl(path):
-    if not path.exists():
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except Exception:
-                    continue
-    except Exception:
-        return
-
-
-def _latest_registered_account_by_email(email):
-    email_l = (email or "").strip().lower()
-    if not email_l:
-        return {}
-    match = {}
-    for item in _iter_jsonl(REGISTERED_ACCOUNTS_FILE) or []:
-        if str(item.get("email", "")).strip().lower() == email_l:
-            match = item
-    return match
-
-
-def _successful_payment_emails():
-    emails = set()
-    for item in _iter_jsonl(CARD_RESULTS_FILE) or []:
-        if item.get("status") == "succeeded":
-            email = (item.get("chatgpt_email") or item.get("email") or "").strip()
-            if email:
-                emails.add(email.lower())
-    for item in _iter_jsonl(RESULTS_FILE) or []:
-        payment = item.get("payment") or {}
-        if payment.get("status") == "succeeded":
-            email = (payment.get("email") or item.get("email") or "").strip()
-            if email:
-                emails.add(email.lower())
-    return sorted(emails)
-
-
-def _latest_refresh_token_from_results(email):
-    email_l = (email or "").strip().lower()
-    if not email_l:
-        return ""
-    token = ""
-    for item in _iter_jsonl(CARD_RESULTS_FILE) or []:
-        if item.get("status") != "succeeded":
-            continue
-        item_email = (item.get("chatgpt_email") or item.get("email") or "").strip().lower()
-        if item_email == email_l and item.get("refresh_token"):
-            token = item.get("refresh_token") or ""
-    return token
-
-
-def sync_success_accounts_to_cockpit():
-    """Write paid accounts in Cockpit's Codex JSON import shape.
-
-    This does not edit Cockpit's live account database. Cockpit can import this
-    file through its existing Codex JSON import path.
-    """
-    if not COCKPIT_PROJECT_DIR.exists():
-        print(f"[Cockpit] 目标项目不存在，跳过: {COCKPIT_PROJECT_DIR}")
-        return 0
-
-    accounts = []
-    for email in _successful_payment_emails():
-        reg = _latest_registered_account_by_email(email)
-        access_token = (reg.get("access_token") or "").strip()
-        if not access_token:
-            continue
-        item = {
-            "email": reg.get("email") or email,
-            "access_token": access_token,
-            "id_token": (reg.get("id_token") or "").strip(),
-            "source": "Gpt-Agreement-Payment-main",
-        }
-        refresh_token = (reg.get("refresh_token") or "").strip() or _latest_refresh_token_from_results(email)
-        if refresh_token:
-            item["refresh_token"] = refresh_token
-        accounts.append(item)
-
-    payload = {
-        "version": "1.0",
-        "source": "Gpt-Agreement-Payment-main",
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "accounts": accounts,
-    }
-
-    try:
-        COCKPIT_IMPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = COCKPIT_IMPORT_FILE.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp, COCKPIT_IMPORT_FILE)
-        print(f"[Cockpit] 已同步成功支付账号 {len(accounts)} 个 → {COCKPIT_IMPORT_FILE}")
-        return len(accounts)
-    except Exception as e:
-        print(f"[Cockpit] 同步失败: {e}")
-        return 0
-
-
 # ──────────────────────────────────────────────
 # 3. Pipeline 调度
 # ──────────────────────────────────────────────
@@ -1001,9 +891,6 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
             except Exception as e:
                 print(f"[CPA] 导入异常: {e}")
                 record["cpa_import"] = "error"
-
-        if pay_status == "succeeded":
-            record["cockpit_sync_count"] = sync_success_accounts_to_cockpit()
 
         _append_result(record)
         emoji = "✓" if pay_status == "succeeded" else "✗"
