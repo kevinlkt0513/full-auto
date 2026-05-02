@@ -1,38 +1,3 @@
-<p align="center">
-  <img src="docs/images/logo-light.png#gh-light-mode-only" width="120" alt="Gpt-Agreement-Payment logo">
-  <img src="docs/images/logo-dark.png#gh-dark-mode-only"   width="120" alt="Gpt-Agreement-Payment logo">
-</p>
-
-# Gpt-Agreement-Payment
-
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![CI](https://img.shields.io/github/actions/workflow/status/DanOps-1/Gpt-Agreement-Payment/ci.yml?label=CI)](https://github.com/DanOps-1/Gpt-Agreement-Payment/actions)
-[![Use](https://img.shields.io/badge/use-CTF%20%2F%20bug%20bounty-red)](#法律边界)
-
-> [!CAUTION]
-> **使用本项目即视为同意 [`NOTICE`](NOTICE) 的全部条款。** 项目按 AS IS 提供、无任何担保、维护者不负任何责任。仅限你拥有的系统 / 合法 CTF / 授权 bug bounty 项目 in-scope 资产 / 安全研究。**严禁**用于欺诈、规避支付、批量造号转售、违反第三方 ToS、未授权目标。一切法律责任由使用者自负。不接受条款就**不要使用**。
-
-
----
-
-## 架构
-
-```mermaid
-flowchart LR
-    A[pipeline.py] --> B[CTF-reg/<br/>browser_register.py<br/>Camoufox + Turnstile]
-    B --> C[CTF-pay/card.py<br/>Stripe Checkout 重放]
-    C --> D[Stripe confirm<br/>+ ChatGPT /approve]
-    D --> E[Camoufox PayPal<br/>协议授权]
-    E --> F[Stripe poll<br/>state=succeeded]
-    F --> G[Camoufox 二次登录<br/>Codex OAuth + PKCE]
-    G --> H[refresh_token<br/>output/results.jsonl]
-```
-
-详细子系统拆解、文件分工、协议链路细节看 [`docs/architecture.md`](docs/architecture.md)。
-
----
-
 ## 文档
 
 | 文档 | 内容 |
