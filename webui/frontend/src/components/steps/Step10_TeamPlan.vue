@@ -1,6 +1,6 @@
 <template>
   <section class="step-fade-in">
-    <div class="term-divider" data-tail="──────────">步骤 10: 订阅方案</div>
+    <div class="term-divider" data-tail="──────────">步骤 11: 订阅方案</div>
     <h2 class="step-h">$&nbsp;Subscription plan<span class="term-cursor"></span></h2>
     <p class="step-sub">选 Plus 或 Team；多数字段都有默认值。</p>
 

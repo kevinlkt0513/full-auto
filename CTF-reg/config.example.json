@@ -6,7 +6,11 @@
     "smtp_port": 465,
     "email": "you@example.com",
     "auth_code": "YOUR_IMAP_AUTH_CODE",
-    "catch_all_domain": "example.com"
+    "catch_all_domain": "example.com",
+    "email_pool": [],
+    "email_pool_file": "",
+    "email_pool_state_path": "",
+    "email_pool_reuse": false
   },
   "card": {
     "number": "",

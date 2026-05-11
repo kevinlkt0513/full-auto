@@ -1,6 +1,6 @@
 <template>
   <section class="step-fade-in">
-    <div class="term-divider" data-tail="──────────">步骤 08: 打码</div>
+    <div class="term-divider" data-tail="──────────">步骤 09: 打码</div>
     <h2 class="step-h">$&nbsp;打码平台 (可选)<span class="term-cursor"></span></h2>
     <p class="step-sub">不填就跳过，浏览器 passive captcha 兜底。</p>
 

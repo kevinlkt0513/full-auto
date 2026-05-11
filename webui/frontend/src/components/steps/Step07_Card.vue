@@ -1,7 +1,7 @@
 <template>
   <section class="step-fade-in">
-    <template v-if="store.isStepHidden(7)">
-      <div class="term-divider" data-tail="──────────">步骤 07: 支付卡 — 已跳过</div>
+    <template v-if="store.isStepHidden(8)">
+      <div class="term-divider" data-tail="──────────">步骤 08: 支付卡 — 已跳过</div>
       <h2 class="step-h">$&nbsp;此步已跳过<span class="term-cursor"></span></h2>
       <p class="step-sub">你在 step 1 选了"PayPal"支付，卡片配置不需要。</p>
       <div class="step-actions">
@@ -9,7 +9,7 @@
       </div>
     </template>
     <template v-else>
-      <div class="term-divider" data-tail="──────────">步骤 07: 支付卡</div>
+      <div class="term-divider" data-tail="──────────">步骤 08: 支付卡</div>
       <h2 class="step-h">$&nbsp;支付卡 + 账单地址<span class="term-cursor"></span></h2>
 
       <div class="form-stack">

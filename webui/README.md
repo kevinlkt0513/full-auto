@@ -16,19 +16,37 @@ python -m webui.server
 
 首次访问会跳到 `/setup` 创建管理员账号。
 
-## 14 步流程
+## 15 步流程
 
 详见 `docs/superpowers/specs/2026-04-28-webui-design.md`。
 
 | Phase | 步骤 |
 |---|---|
-| 1 基础（5）| 模式选择 / 系统依赖 / Cloudflare / IMAP / 代理 |
+| 1 基础（6）| 模式选择 / 系统依赖 / Cloudflare / IMAP / 邮箱地址来源 / 代理 |
 | 2 支付（2）| PayPal / 卡 + Billing |
 | 3 验证码（2，可选）| 打码平台 / VLM endpoint |
 | 4 下游（4）| Team plan / gpt-team / CPA / Daemon / Stripe runtime |
 | 5 完成（1）| Review + 导出 |
 
 每步右栏 `PreflightPanel` 实时显示已通过的 check。
+
+## 固定邮箱池格式
+
+Step 05 选择“固定邮箱池”时，默认读取：
+
+- 邮箱池文件：`/opt/444/output/email_pool.txt`
+- 取号状态：`/opt/444/output/email_pool_state.json`
+
+`email_pool.txt` 是普通文本文件，一行一个已配置转发的邮箱地址：
+
+```text
+# 空行和 # 开头的注释会跳过
+alias-001@example.net
+alias-002@example.net
+alias-003@example.net  # 行尾注释也可以
+```
+
+不要用逗号分隔，也不要写 JSON。系统会去重并按顺序取号；`email_pool_state.json` 会自动创建和更新，不需要手工编辑。
 
 ## 反向代理（公网访问）
 

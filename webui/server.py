@@ -16,13 +16,18 @@ FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Gpt-Agreement-Payment webui")
-    app.include_router(setup_routes.router)
-    app.include_router(auth_routes.router)
-    app.include_router(wizard_routes.router)
-    app.include_router(preflight_routes.router)
-    app.include_router(sniff_routes.router)
-    app.include_router(config_routes.router)
-    app.include_router(run_routes.router)
+    api_routers = (
+        setup_routes.router,
+        auth_routes.router,
+        wizard_routes.router,
+        preflight_routes.router,
+        sniff_routes.router,
+        config_routes.router,
+        run_routes.router,
+    )
+    for router in api_routers:
+        app.include_router(router)
+        app.include_router(router, prefix="/webui")
 
     @app.get("/api/healthz")
     def healthz():
@@ -32,6 +37,7 @@ def create_app() -> FastAPI:
         assets_dir = FRONTEND_DIST / "assets"
         if assets_dir.exists():
             app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+            app.mount("/webui/assets", StaticFiles(directory=assets_dir), name="webui-assets")
 
         @app.get("/{full_path:path}")
         def spa(full_path: str):

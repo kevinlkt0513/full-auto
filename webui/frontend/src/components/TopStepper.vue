@@ -17,7 +17,7 @@
       </span>
     </div>
     <div class="stepper-meta">
-      阶段: {{ currentPhase }} // 第 {{ store.currentStep }}/14 步
+      阶段: {{ currentPhase }} // 第 {{ store.currentStep }}/15 步
     </div>
   </div>
 </template>
@@ -36,7 +36,7 @@ watch(() => store.currentStep, async () => {
   if (active) active.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
 });
 
-// step 6 槽位是「主支付方式」配置，PayPal / GoPay 共用 —— 标签随 pm 切换，
+// step 7 槽位是「主支付方式」配置，PayPal / GoPay 共用 —— 标签随 pm 切换，
 // 否则选了 GoPay 时 stepper 还显示「PAYPAL」会跟实际表单错位。
 const steps = computed(() => {
   const pm = (store.answers.payment as any)?.method;
@@ -46,16 +46,17 @@ const steps = computed(() => {
     { n: 2, title: "系统", phase: "基础" },
     { n: 3, title: "CF", phase: "基础" },
     { n: 4, title: "IMAP", phase: "基础" },
-    { n: 5, title: "代理", phase: "基础" },
-    { n: 6, title: paySlotTitle, phase: "支付" },
-    { n: 7, title: "卡片", phase: "支付" },
-    { n: 8, title: "打码", phase: "可选" },
-    { n: 9, title: "VLM", phase: "可选" },
-    { n: 10, title: "TEAM", phase: "下游" },
-    { n: 11, title: "推送", phase: "下游" },
-    { n: 12, title: "DAEMON", phase: "下游" },
-    { n: 13, title: "STRIPE", phase: "下游" },
-    { n: 14, title: "完成", phase: "出口" },
+    { n: 5, title: "邮箱", phase: "基础" },
+    { n: 6, title: "代理", phase: "基础" },
+    { n: 7, title: paySlotTitle, phase: "支付" },
+    { n: 8, title: "卡片", phase: "支付" },
+    { n: 9, title: "打码", phase: "可选" },
+    { n: 10, title: "VLM", phase: "可选" },
+    { n: 11, title: "TEAM", phase: "下游" },
+    { n: 12, title: "推送", phase: "下游" },
+    { n: 13, title: "DAEMON", phase: "下游" },
+    { n: 14, title: "STRIPE", phase: "下游" },
+    { n: 15, title: "完成", phase: "出口" },
   ];
 });
 

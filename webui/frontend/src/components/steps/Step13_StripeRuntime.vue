@@ -1,7 +1,7 @@
 <template>
   <section class="step-fade-in">
-    <template v-if="store.isStepHidden(13)">
-      <div class="term-divider" data-tail="──────────">步骤 13: Stripe Runtime — 已跳过</div>
+    <template v-if="store.isStepHidden(14)">
+      <div class="term-divider" data-tail="──────────">步骤 14: Stripe Runtime — 已跳过</div>
       <h2 class="step-h">$&nbsp;此步已跳过<span class="term-cursor"></span></h2>
       <p class="step-sub">你在 step 1 选了"PayPal"支付，走 redirect 路径不需要 Stripe runtime hashes（version 有 fallback，js_checksum/rv_timestamp 仅 inline confirm 路径需要）。</p>
       <div class="step-actions">
@@ -9,7 +9,7 @@
       </div>
     </template>
     <template v-else>
-      <div class="term-divider" data-tail="──────────">步骤 13: Stripe Runtime</div>
+      <div class="term-divider" data-tail="──────────">步骤 14: Stripe Runtime</div>
       <h2 class="step-h">$&nbsp;Stripe runtime hashes<span class="term-cursor"></span></h2>
       <p class="step-sub">这一步最容易卡。点"自动嗅探"启 headless Camoufox 走一遍 chatgpt.com pricing 拿当前 hashes。失败可以手填。</p>
 

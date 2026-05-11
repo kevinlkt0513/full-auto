@@ -1,6 +1,6 @@
 <template>
   <section class="step-fade-in">
-    <div class="term-divider" data-tail="──────────">步骤 05: 代理</div>
+    <div class="term-divider" data-tail="──────────">步骤 06: 代理</div>
     <h2 class="step-h">$&nbsp;代理<span class="term-cursor"></span></h2>
     <p class="step-sub">PayPal 锁地区，Stripe 锁国家。出口必须在 EU/US。</p>
 

@@ -1,8 +1,8 @@
 <template>
   <section class="step-fade-in">
     <div class="term-divider" data-tail="──────────">步骤 04: IMAP</div>
-    <h2 class="step-h">$&nbsp;邮箱 IMAP<span class="term-cursor"></span></h2>
-    <p class="step-sub">用来收 OpenAI 注册和 PayPal 登录的 OTP。auth_code 是邮箱厂商给的"专用密码"，不是登录密码。</p>
+    <h2 class="step-h">$&nbsp;IMAP 收件箱<span class="term-cursor"></span></h2>
+    <p class="step-sub">这里只配置实际收验证码的收件箱。下一步再选择注册时填 catch-all 随机邮箱，还是从固定邮箱池顺序取地址。</p>
 
     <div class="form-stack">
       <TermField v-model="form.imap_server" label="IMAP 服务器 · imap_server" placeholder="imap.qq.com" />

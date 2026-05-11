@@ -1,14 +1,17 @@
 """单 active-run 的 pipeline 进程控制器。
 
-封装 `xvfb-run -a python pipeline.py [args]` 子进程：spawn / 流式收 stdout
+封装 `python -u pipeline.py [args]` 子进程：spawn / 流式收 stdout
 到环形日志缓冲 / SIGTERM-优先 stop / 暴露 status + log 给路由层。
+Linux 上如果 PATH 中有 `xvfb-run`，会自动包一层 xvfb。
 
 GoPay 模式下额外支持 OTP 中转：gopay.py 在 stdout 打印
 `GOPAY_OTP_REQUEST path=<file>` 标记后阻塞，runner 记下 file 路径，
 等前端 POST /run/otp 提交 OTP 后写入 file，gopay.py 读取继续。
 """
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -35,8 +38,11 @@ def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: in
               register_only: bool, pay_only: bool, gopay: bool = False,
               gopay_otp_file: str = "") -> list[str]:
     """根据参数拼出最终命令行。"""
-    cmd = ["xvfb-run", "-a", "python", "-u", "pipeline.py",
-           "--config", str(s.PAY_CONFIG_PATH)]
+    python_exe = sys.executable or "python"
+    cmd = [python_exe, "-u", "pipeline.py", "--config", str(s.PAY_CONFIG_PATH)]
+    xvfb_run = shutil.which("xvfb-run")
+    if xvfb_run:
+        cmd = [xvfb_run, "-a", *cmd]
     if gopay:
         cmd.append("--gopay")
         if gopay_otp_file:

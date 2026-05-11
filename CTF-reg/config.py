@@ -17,6 +17,11 @@ class MailConfig:
     email: str = ""
     auth_code: str = ""
     catch_all_domain: str = ""
+    # 指定邮箱池：用于已经转发到 email 收件箱的一组固定邮箱地址。
+    email_pool: list = field(default_factory=list)
+    email_pool_file: str = ""
+    email_pool_state_path: str = ""
+    email_pool_reuse: bool = False
     # 域名池：pipeline 运行时从中挑一个作为 catch_all_domain（轮换 + 根据 invite 探测结果烧掉）
     catch_all_domains: list = field(default_factory=list)
     # Cloudflare 按需开通子域（被 pipeline 读取使用，CTF-reg 自身不处理）
@@ -91,7 +96,13 @@ class Config:
             data = json.load(f)
         cfg = cls()
         if "mail" in data:
-            cfg.mail = MailConfig(**data["mail"])
+            mail_data = dict(data["mail"])
+            base_dir = os.path.dirname(os.path.abspath(path))
+            for key in ("email_pool_file", "email_pool_state_path"):
+                value = str(mail_data.get(key) or "").strip()
+                if value and not os.path.isabs(os.path.expanduser(value)):
+                    mail_data[key] = os.path.abspath(os.path.join(base_dir, value))
+            cfg.mail = MailConfig(**mail_data)
         if "card" in data:
             cfg.card = CardInfo(**data["card"])
         if "billing" in data:

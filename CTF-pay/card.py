@@ -260,6 +260,9 @@ def _approve_chatgpt_checkout(cfg: dict, auth_cfg: dict, session_id: str, proces
     ).strip()
     cookie_header = (auth_cfg.get("cookie_header") or "").strip()
     sentinel_token = (auth_cfg.get("openai_sentinel_token") or "").strip()
+    user_agent = (auth_cfg.get("user_agent") or USER_AGENT).strip()
+    accept_language = (auth_cfg.get("accept_language") or "en-US,en;q=0.9").strip()
+    oai_language = (auth_cfg.get("oai_language") or "en-US").strip()
 
     chatgpt_http_for_approve, _transport = _create_chatgpt_http_session(cfg)
 
@@ -271,6 +274,16 @@ def _approve_chatgpt_checkout(cfg: dict, auth_cfg: dict, session_id: str, proces
         "authorization": f"Bearer {access_token}",
         "origin": "https://chatgpt.com",
         "referer": "https://chatgpt.com/",
+        "user-agent": user_agent,
+        "accept-language": accept_language,
+        "oai-language": oai_language,
+        "oai-session-id": str(uuid.uuid4()),
+        "sec-ch-ua": auth_cfg.get("sec_ch_ua") or '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        "sec-ch-ua-mobile": auth_cfg.get("sec_ch_ua_mobile") or "?0",
+        "sec-ch-ua-platform": auth_cfg.get("sec_ch_ua_platform") or '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     }
     if oai_device_id:
         _base_headers["oai-device-id"] = oai_device_id
@@ -551,13 +564,29 @@ def _provision_openai_auth_via_local_bundle(cfg: dict, fresh_cfg: dict) -> dict:
         billing["currency"] = str(plan_cfg["billing_currency"]).upper()
 
     mail_cfg = ab_cfg.setdefault("mail", {})
-    for key in ("imap_server", "imap_port", "smtp_server", "smtp_port", "email", "auth_code", "catch_all_domain"):
+    for key in (
+        "imap_server",
+        "imap_port",
+        "smtp_server",
+        "smtp_port",
+        "email",
+        "auth_code",
+        "catch_all_domain",
+        "email_pool",
+        "email_pool_file",
+        "email_pool_state_path",
+        "email_pool_reuse",
+    ):
         if key in auto_cfg and auto_cfg.get(key) not in (None, ""):
             mail_cfg[key] = auto_cfg.get(key)
     if isinstance(auto_cfg.get("mail"), dict):
         for key, value in auto_cfg["mail"].items():
             if value not in (None, ""):
                 mail_cfg[key] = value
+    for key in ("email_pool_file", "email_pool_state_path"):
+        value = str(mail_cfg.get(key) or "").strip()
+        if value and not os.path.isabs(os.path.expanduser(value)):
+            mail_cfg[key] = os.path.abspath(os.path.join(os.path.dirname(config_path), value))
 
     fresh_proxy_cfg = fresh_cfg["proxy"] if "proxy" in fresh_cfg else _PROXY_OVERRIDE_SENTINEL
     proxy_url = _build_proxy_url_from_cfg(_resolve_proxy_cfg(cfg, fresh_proxy_cfg))
@@ -608,13 +637,7 @@ logging.basicConfig(
 )
 
 cfg = Config.from_file(config_path)
-mail = MailProvider(
-    cfg.mail.imap_server,
-    cfg.mail.imap_port,
-    cfg.mail.email,
-    cfg.mail.auth_code,
-    cfg.mail.catch_all_domain,
-)
+mail = MailProvider.from_config(cfg.mail)
 flow = AuthFlow(cfg)
 login_email = (os.getenv("LOCALAUTH_LOGIN_EMAIL") or "").strip()
 login_password = os.getenv("LOCALAUTH_LOGIN_PASSWORD", "")
@@ -7929,8 +7952,15 @@ def _run_local_mock_gateway(
     effective_checkout_input = checkout_input
     fresh_info = None
     if _should_generate_fresh_checkout(checkout_input, force_fresh):
-        fresh_info = _build_offline_fresh_checkout_info(cfg)
-        effective_checkout_input = fresh_info["url"]
+        try:
+            fresh_info = _build_offline_fresh_checkout_info(cfg)
+            effective_checkout_input = fresh_info["url"]
+        except FreshCheckoutAuthError as e:
+            _log(
+                "      [local-mock] 本地 flows 不可用，"
+                f"改用 mock gateway 生成 synthetic checkout: {e}"
+            )
+            effective_checkout_input = ""
 
     session_id = ""
     processor_entity = "openai_llc"

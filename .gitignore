@@ -47,5 +47,10 @@ Thumbs.db
 
 # 测试期临时数据
 test_*.py
+!CTF-reg/test_*.py
+!scripts/test_*.py
 !test_rt.py.example
 !webui/tests/test_*.py
+
+# 临时 pip 输出残留
+=1.0

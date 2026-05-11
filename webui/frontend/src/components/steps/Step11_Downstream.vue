@@ -1,6 +1,6 @@
 <template>
   <section class="step-fade-in">
-    <div class="term-divider" data-tail="──────────">步骤 11: 下游推送</div>
+    <div class="term-divider" data-tail="──────────">步骤 12: 下游推送</div>
     <h2 class="step-h">$&nbsp;下游推送 (全部可选)<span class="term-cursor"></span></h2>
 
     <div class="term-divider" style="margin-top:8px">gpt-team</div>
@@ -50,6 +50,7 @@ import TermToggle from "../term/TermToggle.vue";
 const store = useWizardStore();
 const tsInit = store.answers.team_system ?? {};
 const cpaInit = store.answers.cpa ?? {};
+const codexOAuthClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 // 开关默认关闭（不读 init.enabled），但其余字段保留 source 同步的值
 // 这样用户启用 toggle 时直接看到预填的 url/凭据
@@ -61,9 +62,9 @@ const ts = ref({
 });
 const cpa = ref({
   enabled: false,
-  base_url: cpaInit.base_url ?? "",
+  base_url: cpaInit.base_url || "http://127.0.0.1:8317",
   admin_key: cpaInit.admin_key ?? "",
-  oauth_client_id: cpaInit.oauth_client_id ?? "",
+  oauth_client_id: cpaInit.oauth_client_id || codexOAuthClientId,
 });
 
 // 立即同步到 store 覆盖可能从 source 同步过来的 enabled=true，

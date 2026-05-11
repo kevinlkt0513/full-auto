@@ -1,6 +1,6 @@
 <template>
   <section class="step-fade-in">
-    <div class="term-divider" data-tail="──────────">步骤 12: Daemon</div>
+    <div class="term-divider" data-tail="──────────">步骤 13: Daemon</div>
     <h2 class="step-h">$&nbsp;Daemon 参数<span class="term-cursor"></span></h2>
     <p class="step-sub" v-if="!isDaemon" style="color: var(--warn)">当前模式不是 daemon，跳过即可。</p>
 

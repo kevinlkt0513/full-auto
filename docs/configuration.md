@@ -95,15 +95,15 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
 ```json
 "cpa": {
   "enabled": true,
-  "base_url": "https://your-cpa-host/api",
-  "admin_key": "YOUR_CPA_ADMIN_KEY",
-  "oauth_client_id": "YOUR_OPENAI_CODEX_CLIENT_ID",
+  "base_url": "https://your-cpa-host",
+  "admin_key": "YOUR_CPA_MANAGEMENT_KEY",
+  "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
   "plan_tag": "team",
   "timeout_s": 20
 }
 ```
 
-`oauth_client_id` 是 Codex CLI 的 OAuth client_id —— 从 Codex CLI 源码可以看到具体值。
+`base_url` 指向 CLIProxyAPI 根地址，不要带 `/api`。`admin_key` 是 `remote-management.secret-key` 对应的管理 key。
 
 ### `proxies` —— 全局代理池
 
@@ -136,6 +136,9 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
     "email": "you@example.com",
     "auth_code": "YOUR_IMAP_AUTH_CODE",
     "catch_all_domain": "subdomain.example.com",
+    "email_pool_file": "../output/email_pool.txt",
+    "email_pool_state_path": "../output/email_pool_state.json",
+    "email_pool_reuse": false,
     "catch_all_domains": ["subdomain.example.com"],
     "auto_provision": {
       "enabled": false,
@@ -155,6 +158,23 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
 ```
 
 `mail.auto_provision` 是多 zone 域池配置：
+
+如果不用 catch-all 域名，而是已经有一批邮箱地址全部转发到 `mail.email` 对应的 IMAP 收件箱，可以启用邮箱池：
+
+```json
+"mail": {
+  "imap_server": "imap.gmail.com",
+  "imap_port": 993,
+  "email": "kevin.share233@gmail.com",
+  "auth_code": "YOUR_IMAP_AUTH_CODE",
+  "catch_all_domain": "",
+  "email_pool_file": "../output/email_pool.txt",
+  "email_pool_state_path": "../output/email_pool_state.json",
+  "email_pool_reuse": false
+}
+```
+
+`email_pool_file` 一行一个邮箱地址，空行和 `#` 注释会被忽略。注册时会优先从邮箱池顺序取地址；`email_pool_state_path` 用来跨进程记住下一个索引。默认 `email_pool_reuse=false`，池子用完后直接报错，避免无意重复注册同一个邮箱。
 
 | 字段 | 含义 |
 |---|---|

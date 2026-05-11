@@ -1,7 +1,7 @@
 <template>
   <section class="step-fade-in">
-    <template v-if="store.isStepHidden(6)">
-      <div class="term-divider" data-tail="──────────">步骤 06: PayPal — 已跳过</div>
+    <template v-if="store.isStepHidden(7)">
+      <div class="term-divider" data-tail="──────────">步骤 07: PayPal — 已跳过</div>
       <h2 class="step-h">$&nbsp;此步已跳过<span class="term-cursor"></span></h2>
       <p class="step-sub">你在 step 1 选了"纯卡"支付，PayPal 配置不需要。</p>
       <div class="step-actions">
@@ -9,7 +9,7 @@
       </div>
     </template>
     <template v-else>
-      <div class="term-divider" data-tail="──────────">步骤 06: PayPal</div>
+      <div class="term-divider" data-tail="──────────">步骤 07: PayPal</div>
       <h2 class="step-h">$&nbsp;PayPal 凭据<span class="term-cursor"></span></h2>
       <p class="step-sub">第一次跑要人肉过一次邮箱 OTP 2FA。这里只校验字段格式，不真登录避免触发 2FA。</p>
 

@@ -38,11 +38,25 @@ def test_team_system_bad_creds(client):
 @respx.mock
 def test_cpa_ok(client):
     _login(client)
-    respx.get("https://cpa.example.com/api/v0/health").mock(
-        return_value=Response(200, json={"status": "ok"})
+    route = respx.get("https://cpa.example.com/v0/management/config").mock(
+        return_value=Response(200, json={"proxy-url": ""})
     )
     r = client.post("/api/preflight/cpa", json={
         "base_url": "https://cpa.example.com/api",
         "admin_key": "k",
     })
     assert r.json()["status"] == "ok"
+    assert route.calls.last.request.headers["authorization"] == "Bearer k"
+
+
+@respx.mock
+def test_cpa_bad_key(client):
+    _login(client)
+    respx.get("https://cpa.example.com/v0/management/config").mock(
+        return_value=Response(401, json={"error": "missing management key"})
+    )
+    r = client.post("/api/preflight/cpa", json={
+        "base_url": "https://cpa.example.com",
+        "admin_key": "bad",
+    })
+    assert r.json()["status"] == "fail"

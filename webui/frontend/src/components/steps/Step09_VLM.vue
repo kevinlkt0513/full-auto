@@ -1,6 +1,6 @@
 <template>
   <section class="step-fade-in">
-    <div class="term-divider" data-tail="──────────">步骤 09: VLM</div>
+    <div class="term-divider" data-tail="──────────">步骤 10: VLM</div>
     <h2 class="step-h">$&nbsp;VLM endpoint (可选)<span class="term-cursor"></span></h2>
     <p class="step-sub">家宽 / 伪家宽出口通常不触发 hCaptcha；不填会自动降级到 CLIP。</p>
 

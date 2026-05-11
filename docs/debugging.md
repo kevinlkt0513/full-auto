@@ -24,8 +24,145 @@ ls -lah /tmp/paypal_*.png
 # 二次 OAuth 登录截图
 ls -lah /tmp/rt_*.png
 
+# Camoufox 注册逐步截图（北京时间命名）
+ls -lt /tmp/browser_reg_step_*_BJT_*.png | head -20
+
+# 最近一次注册流程的逐步截图时间线
+python CTF-reg/registration_evidence.py --dir /tmp
+
 # Daemon 状态
 cat output/daemon_state.json | jq .
+```
+
+---
+
+## WebUI / Dashboard 状态
+
+WebUI 预期只绑定 Tailscale 内网地址：
+
+```text
+http://100.89.13.34:8765/webui/
+```
+
+`444-webui.service` 可能显示 `inactive`，但 dashboard 仍可能由当前 `uvicorn`
+进程运行。不要只根据 systemd active 状态判断是否可用；用下面的只读检查：
+
+```bash
+cd /opt/444
+python scripts/verify_webui_runtime.py
+```
+
+确认最近 dashboard API 活动：
+
+```bash
+cd /opt/444
+python scripts/summarize_webui_access_log.py --tail 300
+```
+
+把注册失败日志、最近注册截图时间线和 WebUI access log 串成一份诊断报告：
+
+```bash
+cd /opt/444
+python scripts/diagnose_registration_failure.py --failure-log logs/failure_2.log
+```
+
+诊断报告会为失败日志中的截图路径和最近逐步截图生成 viewer 直达 URL。默认
+viewer base URL 是 `http://100.89.13.34:18080`；如果 viewer 地址调整，可加：
+
+```bash
+python scripts/diagnose_registration_failure.py --failure-log logs/failure_2.log --viewer-base-url http://100.x.x.x:18080
+```
+
+成功时会确认：
+
+- systemd unit 的 `ExecStart` 使用 Tailscale `100.x` 地址。
+- 该 host/port 可以 TCP 连接。
+- `/api/healthz` 返回 `200`。
+- 无凭证访问 `/webui/api/run/status` 返回 `401`，说明运行状态 API 有 auth gate。
+
+手动复核：
+
+```bash
+systemctl is-active 444-webui.service || true
+ss -ltnp | grep ':8765'
+curl -sS -o /dev/null -w '%{http_code}\n' http://100.89.13.34:8765/api/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' http://100.89.13.34:8765/webui/api/run/status
+```
+
+`scripts/summarize_webui_access_log.py` 不访问 live API，只读取 `output/webui.log`，
+用于定位最近一次 `POST /webui/api/run/start`、`GET /webui/api/run/status`、
+`GET /webui/api/run/stream`、health check 和无凭证 `401` auth gate。
+`scripts/diagnose_registration_failure.py` 同样只读取本地日志和截图目录，不会启动
+注册、支付或浏览器流程。
+
+未经当前明确授权，不要重启 `444-webui.service`、修改 systemd、改防火墙或改公网入口。
+
+---
+
+## 注册截图查看
+
+注册浏览器流程会在关键页面状态保存逐步截图，文件名使用北京时间
+`YYYYMMDD_HHMMSS_BJT`，格式如下：
+
+```text
+/tmp/browser_reg_step_20260505_162221_BJT_001_home_domcontentloaded.png
+```
+
+可通过 Tailscale 内网图片服务查看：
+
+```text
+http://100.89.13.34:18080/
+```
+
+服务只展示白名单截图路径，不开放任意目录浏览。健康检查：
+
+```bash
+curl -fsS http://100.89.13.34:18080/healthz
+```
+
+当前 viewer 服务的白名单来自 systemd 环境变量 `SHOT_VIEW_GLOBS`：
+
+```text
+/tmp/browser_reg*.png
+/tmp/paypal_*.png
+/tmp/rt_*.png
+/tmp/hcaptcha_auto_solver_live/*.png
+/opt/444/output/**/*.png
+/opt/444/logs/*.png
+```
+
+验证文档是否覆盖 live service 白名单：
+
+```bash
+cd /opt/444
+python scripts/verify_screenshot_viewer_docs.py
+```
+
+可选环境变量：
+
+```bash
+# 禁用注册截图
+BROWSER_REG_SCREENSHOTS=0
+
+# 改注册截图输出目录
+BROWSER_REG_SCREENSHOT_DIR=/tmp
+```
+
+截图文件名只包含 ASCII 字母、数字、点、下划线和短横线，便于 HTTP
+服务、shell、归档脚本稳定处理。
+
+按时间线复盘最近一次注册流程：
+
+```bash
+cd /opt/444
+python CTF-reg/registration_evidence.py --dir /tmp
+```
+
+输出列为 `kind seq stamp stage path`。默认只列最近一次逐步截图序列，从
+`seq=001` 到最后一个步骤；需要同时查看旧式单点截图时：
+
+```bash
+python CTF-reg/registration_evidence.py --dir /tmp --all | tail -40
 ```
 
 ---
@@ -75,6 +212,43 @@ print(r.status_code, r.json())
 
 如果是 401 / token_invalidated → 重新注册或刷新 session_token。
 如果是 401 / account_deactivated → 这号死了，换号。
+
+### 注册阶段 `auth.openai.com 返回错误页` / `Operation timed out`
+
+Camoufox 注册过程中，如果 OpenAI auth 页面显示 `Oops, an error occurred!`
+和 `Operation timed out`，程序会立即失败并保留截图，不再等到外层
+`注册超时`。
+
+**排错**：
+
+```bash
+# 一次性报告：失败根因、截图路径、最近截图时间线、WebUI access log 摘要
+python scripts/diagnose_registration_failure.py --failure-log logs/failure_2.log
+
+# 报告中的 failure_screenshot_viewer_urls 和 latest_timeline_viewer_urls
+# 可以直接在 Tailscale 网络内打开对应截图。
+
+# 看最近一次注册逐步截图
+ls -lt /tmp/browser_reg_step_*_BJT_*.png | head -10
+
+# 按 seq 顺序看最近一次注册流程
+python CTF-reg/registration_evidence.py --dir /tmp
+
+# 看旧式 auth 错误页截图（兼容历史产物）
+ls -lt /tmp/browser_reg_auth_error_*.png | head -10
+```
+
+这个错误来自上游 auth 页面或当前出口网络链路，通常优先检查代理出口、
+DNS/网络延迟和域池配置。若子进程完全静默，`pipeline.register()` 仍会按
+注册 timeout 主动 kill 并返回 `注册超时`。
+
+阶段含义：
+
+- `auth_error_password-wait`：邮箱提交后、密码框出现前进入 auth 错误页。
+- `auth_error_anti-fraud-wait`：密码提交后、等待反欺诈/OTP 前进入 auth 错误页。
+
+这两类都不是 IMAP OTP 超时；先看截图和出口网络，再判断是否需要换代理、
+域池或运行环境。
 
 ### `DatadomeSliderError`
 

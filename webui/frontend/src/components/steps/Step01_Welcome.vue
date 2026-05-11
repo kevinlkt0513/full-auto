@@ -8,7 +8,7 @@
 
     <div class="term-divider" data-tail="──────────" style="margin-top:32px">支付方式</div>
     <h3 class="step-h2">$&nbsp;支付方式</h3>
-    <p class="step-sub">决定后面 step 6 (PayPal) 和 step 7 (卡) 哪些显示。"双备份"等同于两边都填，pipeline 按 <code>--paypal</code> 切换。</p>
+    <p class="step-sub">决定后面 step 7 (PayPal) 和 step 8 (卡) 哪些显示。"双备份"等同于两边都填，pipeline 按 <code>--paypal</code> 切换。</p>
 
     <TermChoice v-model="payment" :options="paymentOptions" :cols="2" @update:modelValue="onPaymentChange" />
   </section>

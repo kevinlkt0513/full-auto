@@ -1,7 +1,13 @@
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from . import settings as s
+
+
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+DEFAULT_EMAIL_POOL_FILE = str(s.ROOT / "output" / "email_pool.txt")
+DEFAULT_EMAIL_POOL_STATE_PATH = str(s.ROOT / "output" / "email_pool_state.json")
 
 
 def _deep_merge(dst: dict, src: dict) -> dict:
@@ -25,6 +31,36 @@ def _payment_method(answers: dict) -> str:
     return (answers.get("payment") or {}).get("method", "both")
 
 
+def _normalize_cpa_base_url(base_url: str) -> str:
+    base = (base_url or "").strip().rstrip("/")
+    if base.endswith("/api"):
+        base = base[:-4].rstrip("/")
+    return base
+
+
+def _normalize_proxy_url(proxy_url: str) -> str:
+    raw = (proxy_url or "").strip()
+    try:
+        pp = urlparse(raw)
+    except ValueError:
+        return raw
+    if not pp.netloc or not pp.username or pp.password is not None or "@" not in pp.username:
+        return raw
+    userinfo, hostinfo = pp.netloc.rsplit("@", 1)
+    username, password = userinfo.split("@", 1)
+    return pp._replace(netloc=f"{username}:{password}@{hostinfo}").geturl()
+
+
+def _email_pool_path(value: str, default: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return str((s.REG_CONFIG_PATH.parent / raw).resolve())
+
+
 def _project_pay(answers: dict) -> dict:
     """Map flat wizard answers onto CTF-pay config schema."""
     out: dict = {}
@@ -38,6 +74,14 @@ def _project_pay(answers: dict) -> dict:
         }
     if "team_system" in answers:
         out["team_system"] = answers["team_system"]
+    if "cpa" in answers:
+        cpa = dict(answers["cpa"] or {})
+        if cpa.get("enabled"):
+            cpa["base_url"] = _normalize_cpa_base_url(cpa.get("base_url", ""))
+            cpa["oauth_client_id"] = (cpa.get("oauth_client_id") or CODEX_OAUTH_CLIENT_ID).strip()
+            cpa.setdefault("plan_tag", "team")
+            cpa.setdefault("timeout_s", 20)
+            out["cpa"] = cpa
     if pm == "gopay" and "gopay" in answers:
         gp = answers["gopay"] or {}
         if all(gp.get(k) for k in ("country_code", "phone_number", "pin")):
@@ -74,7 +118,7 @@ def _project_pay(answers: dict) -> dict:
     if "proxy" in answers:
         proxy = answers["proxy"]
         if proxy.get("url"):
-            out["proxy"] = proxy["url"]
+            out["proxy"] = _normalize_proxy_url(proxy["url"])
         # webshare 段：仅 mode=webshare 且填了 api_key 才写
         if proxy.get("mode") == "webshare" and proxy.get("api_key"):
             out["webshare"] = {
@@ -97,11 +141,35 @@ def _project_reg(answers: dict) -> dict:
     pm = _payment_method(answers)
     if "imap" in answers:
         mail = dict(answers["imap"])
-        # 用 cloudflare zone 作为 catch-all 域；email routing 需在 CF 那边配好转发到 mail.email
+        mailbox = dict(answers.get("mailbox") or {})
+        mailbox_mode = mailbox.get("mode", "catch_all")
         zones = (answers.get("cloudflare") or {}).get("zone_names") or []
-        if zones:
-            mail["catch_all_domain"] = zones[0]
-            mail["catch_all_domains"] = list(zones)
+        if mailbox_mode == "fixed_pool":
+            mail["catch_all_domain"] = ""
+            mail["catch_all_domains"] = []
+            mail["email_pool"] = mailbox.get("email_pool") or []
+            mail["email_pool_file"] = _email_pool_path(
+                mailbox.get("email_pool_file"),
+                DEFAULT_EMAIL_POOL_FILE,
+            )
+            mail["email_pool_state_path"] = _email_pool_path(
+                mailbox.get("email_pool_state_path"),
+                DEFAULT_EMAIL_POOL_STATE_PATH,
+            )
+            mail["email_pool_reuse"] = bool(mailbox.get("email_pool_reuse", False))
+        else:
+            catch_all_domain = (mailbox.get("catch_all_domain") or "").strip()
+            if catch_all_domain:
+                mail["catch_all_domain"] = catch_all_domain
+            elif zones:
+                # 用 cloudflare zone 作为 catch-all 域；email routing 需在 CF 那边配好转发到 mail.email
+                mail["catch_all_domain"] = zones[0]
+            if zones:
+                mail["catch_all_domains"] = list(zones)
+            mail["email_pool"] = []
+            mail["email_pool_file"] = ""
+            mail["email_pool_state_path"] = ""
+            mail["email_pool_reuse"] = False
         out["mail"] = mail
     if "card" in answers and pm in ("card", "both"):
         out["card"] = {k: answers["card"].get(k, "") for k in ("number", "cvc", "exp_month", "exp_year")}
@@ -112,7 +180,7 @@ def _project_reg(answers: dict) -> dict:
     if "captcha" in answers:
         out["captcha"] = {"client_key": answers["captcha"].get("client_key") or answers["captcha"].get("api_key", "")}
     if "proxy" in answers and answers["proxy"].get("url"):
-        out["proxy"] = answers["proxy"]["url"]
+        out["proxy"] = _normalize_proxy_url(answers["proxy"]["url"])
     return out
 
 

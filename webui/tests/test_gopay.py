@@ -37,6 +37,7 @@ CHALLENGE_ID2 = "99999999-1111-2222-3333-444444444444"
 PIN_JWT_LINK = "eyJ0eXAi.linktoken.xxx"
 PIN_JWT_CHARGE = "eyJ0eXAi.chargetoken.yyy"
 STRIPE_PK = "pk_live_test_xxx"
+STRIPE_BASE = "https://pay.openai.com"
 
 
 # ────────────────── helper to build a charger with mocks ──────────────────
@@ -61,13 +62,13 @@ def test_full_flow_succeeds():
     )
     # Step 2: stripe payment_methods
     responses.post(
-        "https://api.stripe.com/v1/payment_methods",
+        f"{STRIPE_BASE}/v1/payment_methods",
         json={"id": PM_ID, "type": "gopay"},
     )
-    responses.post(f"https://api.stripe.com/v1/payment_pages/{CS_ID}/init", json={"init_checksum": "fake_ic"})
+    responses.post(f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}/init", json={"init_checksum": "fake_ic"})
     # Step 3: stripe confirm
     responses.post(
-        f"https://api.stripe.com/v1/payment_pages/{CS_ID}/confirm",
+        f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}/confirm",
         json={"payment_status": "open"},
     )
     # Step 4: chatgpt approve
@@ -78,7 +79,7 @@ def test_full_flow_succeeds():
     # Step 5a: payment_pages refetch → setup_intent.next_action.redirect_to_url.url
     pm_redirect_url = f"https://pm-redirects.stripe.com/authorize/acct_test/sa_nonce_{SNAP_TOKEN[:10]}"
     responses.get(
-        f"https://api.stripe.com/v1/payment_pages/{CS_ID}",
+        f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}",
         json={
             "setup_intent": {
                 "status": "requires_action",
@@ -216,13 +217,13 @@ def test_full_flow_succeeds():
 def test_linking_406_exhaustion_raises():
     # Pre-flow: stub the early steps minimally so we get to linking
     responses.post("https://chatgpt.com/backend-api/payments/checkout", json={"id": CS_ID, "session_id": CS_ID})
-    responses.post("https://api.stripe.com/v1/payment_methods", json={"id": PM_ID})
-    responses.post(f"https://api.stripe.com/v1/payment_pages/{CS_ID}/init", json={"init_checksum": "fake_ic"})
-    responses.post(f"https://api.stripe.com/v1/payment_pages/{CS_ID}/confirm", json={"payment_status": "open"})
+    responses.post(f"{STRIPE_BASE}/v1/payment_methods", json={"id": PM_ID})
+    responses.post(f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}/init", json={"init_checksum": "fake_ic"})
+    responses.post(f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}/confirm", json={"payment_status": "open"})
     responses.post("https://chatgpt.com/backend-api/payments/checkout/approve", json={"result": "approved"})
     pm_redirect_url2 = f"https://pm-redirects.stripe.com/authorize/acct_test/sa_nonce_{SNAP_TOKEN[:10]}"
     responses.get(
-        f"https://api.stripe.com/v1/payment_pages/{CS_ID}",
+        f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}",
         json={"setup_intent": {"status": "requires_action",
               "next_action": {"redirect_to_url": {"url": pm_redirect_url2}}}},
     )
@@ -254,13 +255,13 @@ def test_linking_406_exhaustion_raises():
 @responses.activate
 def test_otp_provider_cancel_raises():
     responses.post("https://chatgpt.com/backend-api/payments/checkout", json={"id": CS_ID, "session_id": CS_ID})
-    responses.post("https://api.stripe.com/v1/payment_methods", json={"id": PM_ID})
-    responses.post(f"https://api.stripe.com/v1/payment_pages/{CS_ID}/init", json={"init_checksum": "fake_ic"})
-    responses.post(f"https://api.stripe.com/v1/payment_pages/{CS_ID}/confirm", json={"payment_status": "open"})
+    responses.post(f"{STRIPE_BASE}/v1/payment_methods", json={"id": PM_ID})
+    responses.post(f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}/init", json={"init_checksum": "fake_ic"})
+    responses.post(f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}/confirm", json={"payment_status": "open"})
     responses.post("https://chatgpt.com/backend-api/payments/checkout/approve", json={"result": "approved"})
     pm_redirect_url3 = f"https://pm-redirects.stripe.com/authorize/acct_test/sa_nonce_{SNAP_TOKEN[:10]}"
     responses.get(
-        f"https://api.stripe.com/v1/payment_pages/{CS_ID}",
+        f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}",
         json={"setup_intent": {"status": "requires_action",
               "next_action": {"redirect_to_url": {"url": pm_redirect_url3}}}},
     )
@@ -306,13 +307,13 @@ def test_otp_provider_cancel_raises():
 @responses.activate
 def test_pin_rejected_raises():
     responses.post("https://chatgpt.com/backend-api/payments/checkout", json={"id": CS_ID, "session_id": CS_ID})
-    responses.post("https://api.stripe.com/v1/payment_methods", json={"id": PM_ID})
-    responses.post(f"https://api.stripe.com/v1/payment_pages/{CS_ID}/init", json={"init_checksum": "fake_ic"})
-    responses.post(f"https://api.stripe.com/v1/payment_pages/{CS_ID}/confirm", json={"payment_status": "open"})
+    responses.post(f"{STRIPE_BASE}/v1/payment_methods", json={"id": PM_ID})
+    responses.post(f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}/init", json={"init_checksum": "fake_ic"})
+    responses.post(f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}/confirm", json={"payment_status": "open"})
     responses.post("https://chatgpt.com/backend-api/payments/checkout/approve", json={"result": "approved"})
     pm_redirect_url4 = f"https://pm-redirects.stripe.com/authorize/acct_test/sa_nonce_{SNAP_TOKEN[:10]}"
     responses.get(
-        f"https://api.stripe.com/v1/payment_pages/{CS_ID}",
+        f"{STRIPE_BASE}/v1/payment_pages/{CS_ID}",
         json={"setup_intent": {"status": "requires_action",
               "next_action": {"redirect_to_url": {"url": pm_redirect_url4}}}},
     )

@@ -22,15 +22,28 @@ import time
 import logging
 import tempfile
 import shutil
+import subprocess
 import json
 import re
 import hashlib
 import base64
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlparse, urlencode, parse_qs
 
 logger = logging.getLogger(__name__)
+
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _beijing_timestamp() -> str:
+    return datetime.now(_BEIJING_TZ).strftime("%Y%m%d_%H%M%S_BJT")
+
+
+def _safe_filename_part(value: str, fallback: str = "step", max_len: int = 80) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "").strip("._-").lower()
+    return (safe or fallback)[:max_len].strip("._-") or fallback
 
 
 def _gen_name() -> tuple[str, str]:
@@ -67,27 +80,89 @@ def _allow_numeric_otp_fallback(page_url: str) -> bool:
     return "email-verification" in url or "otp" in url
 
 
+def _summarize_auth_error_page(page) -> str:
+    """Return a short auth.openai.com error summary, or empty string if absent."""
+    try:
+        url = page.url or ""
+    except Exception:
+        return ""
+    if "auth.openai.com" not in url:
+        return ""
+
+    try:
+        body = page.locator("body").inner_text(timeout=1000)
+    except Exception:
+        try:
+            body = page.evaluate("() => document.body && document.body.innerText || ''")
+        except Exception:
+            return ""
+
+    normalized = " ".join((body or "").split())
+    lower = normalized.lower()
+    if not normalized:
+        return ""
+    if "oops, an error occurred" not in lower and "operation timed out" not in lower:
+        return ""
+    return normalized[:300]
+
+
 def _parse_proxy(proxy_url: str):
     """Camoufox 需要 socks5 + 无 auth 的格式。socks5 + auth 需要走 gost 中继。"""
     if not proxy_url:
         return None
     pp = urlparse(proxy_url)
     if pp.scheme in ("socks5", "socks5h") and pp.username:
-        import socket as _sock
         relay_port = 18899
-        try:
-            with _sock.create_connection(("127.0.0.1", relay_port), timeout=2):
-                pass
+        ok, info = _ensure_gost_relay(proxy_url, relay_port)
+        if ok:
             return {"server": f"socks5://127.0.0.1:{relay_port}"}
-        except Exception:
-            raise RuntimeError(
-                f"需要 gost 中继: gost -L=socks5://:{relay_port} -F={proxy_url}"
-            )
+        raise RuntimeError(f"需要 gost 中继但启动失败: {info}")
     return {
         "server": f"{pp.scheme}://{pp.hostname}:{pp.port}",
         "username": pp.username or "",
         "password": pp.password or "",
     }
+
+
+def _port_listening(port: int) -> bool:
+    import socket as _sock
+    try:
+        with _sock.create_connection(("127.0.0.1", port), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_gost_relay(upstream_url: str, listen_port: int) -> tuple[bool, str]:
+    if _port_listening(listen_port):
+        return True, f"relay on :{listen_port} already listening"
+
+    gost_bin = shutil.which("gost")
+    if not gost_bin:
+        return False, "gost 未安装"
+
+    log_path = f"/tmp/gost-{listen_port}.log"
+    cmd = [gost_bin, f"-L=socks5://127.0.0.1:{listen_port}", f"-F={upstream_url}"]
+    try:
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=fd, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+        finally:
+            os.close(fd)
+    except Exception as e:
+        return False, f"spawn 失败: {e}"
+
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False, f"gost 启动后立即退出 (rc={proc.returncode})，见 {log_path}"
+        if _port_listening(listen_port):
+            return True, f"started PID={proc.pid} log={log_path}"
+        time.sleep(0.2)
+    return False, f"gost 4s 内未监听 :{listen_port}，见 {log_path}"
 
 
 def browser_register(cfg, mail_provider) -> dict:
@@ -141,6 +216,37 @@ def browser_register(cfg, mail_provider) -> dict:
             locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            screenshot_seq = 0
+
+            def _capture_step(stage: str, full_page: bool = False) -> str:
+                nonlocal screenshot_seq
+                if str(os.environ.get("BROWSER_REG_SCREENSHOTS", "1")).lower() in ("0", "false", "no", "off"):
+                    return ""
+                screenshot_seq += 1
+                safe_stage = _safe_filename_part(stage)
+                screenshot_dir = os.environ.get("BROWSER_REG_SCREENSHOT_DIR", "/tmp")
+                filename = f"browser_reg_step_{_beijing_timestamp()}_{screenshot_seq:03d}_{safe_stage}.png"
+                path = os.path.join(screenshot_dir, filename)
+                try:
+                    os.makedirs(screenshot_dir, exist_ok=True)
+                    page.screenshot(path=path, full_page=full_page)
+                    logger.info(f"[browser-reg] 截图 {stage}: {path}")
+                    return path
+                except Exception as e:
+                    logger.warning(f"[browser-reg] 截图失败 {stage}: {e}")
+                    return ""
+
+            def _raise_if_auth_error(stage: str) -> None:
+                summary = _summarize_auth_error_page(page)
+                if not summary:
+                    return
+                screenshot_path = _capture_step(f"auth_error_{stage}")
+                raise RuntimeError(
+                    f"auth.openai.com 返回错误页 ({stage}): {summary}; "
+                    f"screenshot={screenshot_path}"
+                )
+
+            _capture_step("browser_context_ready")
 
             def _find_otp_inputs():
                 single = page.query_selector('input[autocomplete="one-time-code"]') or \
@@ -172,6 +278,7 @@ def browser_register(cfg, mail_provider) -> dict:
                     if b and b.is_visible():
                         b.click()
                         logger.info(f"[browser-reg] 点击 {context_label} 继续: {sel}")
+                        _capture_step(f"{context_label}_continue_clicked")
                         return True
                 return False
 
@@ -194,11 +301,13 @@ def browser_register(cfg, mail_provider) -> dict:
 
                 otp_filled = False
                 if single:
+                    _capture_step(f"{context_label}_otp_input_ready")
                     single.click()
                     time.sleep(0.3)
                     single.fill(otp_code)
                     otp_filled = True
                 else:
+                    _capture_step(f"{context_label}_otp_digit_inputs_ready")
                     for i, ch in enumerate(otp_code[:6]):
                         digits[i].click()
                         time.sleep(0.1)
@@ -206,11 +315,13 @@ def browser_register(cfg, mail_provider) -> dict:
                     otp_filled = True
 
                 if not otp_filled:
-                    page.screenshot(path=f"/tmp/browser_reg_{context_label}_otp_fail.png")
+                    _capture_step(f"{context_label}_otp_fail")
                     raise RuntimeError("OTP 输入框未找到")
+                _capture_step(f"{context_label}_otp_filled")
                 time.sleep(0.8)
                 _submit_visible_continue(context_label)
                 time.sleep(4)
+                _capture_step(f"{context_label}_otp_submitted")
                 return True
 
             def _retry_current_otp_submit(context_label: str) -> bool:
@@ -264,6 +375,7 @@ def browser_register(cfg, mail_provider) -> dict:
                     logger.info(f"[browser-reg] 使用真实 auth URL 兜底: {auth_url[:100]}")
                     page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
                     time.sleep(3)
+                    _capture_step("fallback_real_auth_url_loaded")
                     if _has_email_input():
                         return True
 
@@ -276,6 +388,7 @@ def browser_register(cfg, mail_provider) -> dict:
                         logger.info(f"[browser-reg] 注册入口兜底跳转: {url}")
                         page.goto(url, wait_until="domcontentloaded", timeout=60000)
                         time.sleep(3)
+                        _capture_step(f"fallback_signup_url_{urlparse(url).netloc}")
                         if _has_email_input():
                             return True
                         for sel in ['a:has-text("Sign up")', 'button:has-text("Sign up")',
@@ -284,6 +397,7 @@ def browser_register(cfg, mail_provider) -> dict:
                             if b and b.is_visible():
                                 b.click(timeout=5000)
                                 time.sleep(3)
+                                _capture_step("fallback_signup_click")
                                 if _has_email_input():
                                     return True
                     except Exception as e:
@@ -293,6 +407,7 @@ def browser_register(cfg, mail_provider) -> dict:
             # [1] 打开 ChatGPT 首页，点 "Sign up for free"
             logger.info("[browser-reg] 打开 ChatGPT 首页 ...")
             page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            _capture_step("home_domcontentloaded")
             # 等 React 渲染完成 + Sign up 按钮可交互
             try:
                 page.wait_for_selector('button[data-testid="signup-button"], a[data-testid="signup-button"]',
@@ -300,6 +415,7 @@ def browser_register(cfg, mail_provider) -> dict:
             except Exception:
                 pass
             time.sleep(3)
+            _capture_step("home_signup_ready")
 
             # 点击 Sign up 按钮 — 找右上角的 "Sign up for free"
             clicked_signup = False
@@ -328,6 +444,7 @@ def browser_register(cfg, mail_provider) -> dict:
                             btn.evaluate("el => el.click()")
                         clicked_signup = True
                         logger.info(f"[browser-reg] 点击 Sign up ({sel}): {text[:40]}")
+                        _capture_step("signup_clicked")
                         break
                     except Exception as e_click:
                         if "attached to the DOM" in str(e_click) or "detached" in str(e_click).lower():
@@ -336,7 +453,7 @@ def browser_register(cfg, mail_provider) -> dict:
                 if clicked_signup:
                     break
             if not clicked_signup:
-                page.screenshot(path="/tmp/browser_reg_no_signup.png")
+                _capture_step("no_signup_button")
                 raise RuntimeError(f"未找到 Sign up 按钮, URL={page.url[:120]}")
 
             # 等待跳转到 auth.openai.com 或 modal 加载（含重试点击）
@@ -344,6 +461,7 @@ def browser_register(cfg, mail_provider) -> dict:
             for i in range(20):
                 time.sleep(1)
                 if "auth.openai.com" in page.url or _has_email_input():
+                    _capture_step("signup_navigation_ready")
                     break
                 # 如果 5s 后还没变化，重试点击 Sign up
                 if i == 5 and page.url == pre_url:
@@ -352,6 +470,7 @@ def browser_register(cfg, mail_provider) -> dict:
                         btn = page.query_selector('button[data-testid="signup-button"], a[data-testid="signup-button"]')
                         if btn:
                             btn.click(timeout=3000)
+                            _capture_step("signup_retry_clicked")
                     except Exception:
                         try:
                             btn.evaluate("el => el.click()")
@@ -362,7 +481,7 @@ def browser_register(cfg, mail_provider) -> dict:
                     if _goto_real_auth_signup():
                         break
             logger.info(f"[browser-reg] 当前 URL: {page.url[:120]}")
-            page.screenshot(path="/tmp/browser_reg_before_email.png")
+            _capture_step("before_email")
 
             # [2] 填邮箱（click + fill 分步，React 重渲染可能让 handle 失效 → 每步重新 query）
             logger.info("[browser-reg] 填邮箱 ...")
@@ -371,8 +490,9 @@ def browser_register(cfg, mail_provider) -> dict:
             try:
                 page.wait_for_selector(email_selector, timeout=30000)
             except Exception as e:
-                page.screenshot(path="/tmp/browser_reg_email_timeout.png")
+                _capture_step("email_input_timeout")
                 raise RuntimeError(f"等待邮箱输入框超时，当前 URL={page.url[:160]}") from e
+            _capture_step("email_input_ready")
             for _try in range(4):
                 try:
                     ei = page.query_selector('input[type="email"]') or \
@@ -385,6 +505,7 @@ def browser_register(cfg, mail_provider) -> dict:
                           page.query_selector('input[name="email"]') or \
                           page.query_selector('input[autocomplete="email"]')
                     (ei2 or ei).fill(email)
+                    _capture_step("email_filled")
                     break
                 except Exception as e:
                     if "not attached" in str(e).lower() or "detached" in str(e).lower():
@@ -400,8 +521,11 @@ def browser_register(cfg, mail_provider) -> dict:
                 if b and b.is_visible():
                     b.click()
                     logger.info(f"[browser-reg] 点击 email 继续: {sel}")
+                    _capture_step("email_continue_clicked")
                     break
             time.sleep(3)
+            _capture_step("email_continue_result")
+            _raise_if_auth_error("email-continue")
 
             # [3] 填密码（新账号会看到密码框）
             logger.info("[browser-reg] 等待密码框 ...")
@@ -410,11 +534,13 @@ def browser_register(cfg, mail_provider) -> dict:
                     'input[type="password"], input[name="password"]',
                     state="visible", timeout=30000,
                 )
+                _capture_step("password_input_ready")
                 pwd_input = page.query_selector('input[type="password"]:visible') or \
                             page.query_selector('input[name="password"]:visible')
                 pwd_input.click()
                 time.sleep(0.3)
                 pwd_input.fill(password)
+                _capture_step("password_filled")
                 time.sleep(random.uniform(0.5, 1.2))
                 for sel in ['button[type="submit"]', 'button:has-text("Continue")',
                             'button:has-text("Create")', 'button:has-text("Next")']:
@@ -422,39 +548,51 @@ def browser_register(cfg, mail_provider) -> dict:
                     if b and b.is_visible():
                         b.click()
                         logger.info(f"[browser-reg] 点击 password 继续: {sel}")
+                        _capture_step("password_continue_clicked")
                         break
             except Exception as e:
+                _raise_if_auth_error("password-wait")
                 logger.warning(f"[browser-reg] 密码框异常: {e}，可能走无密码 OTP 路径")
+                _capture_step("password_wait_exception")
 
             time.sleep(3)
+            _capture_step("password_submit_result")
+            _raise_if_auth_error("password-submit")
             logger.info(f"[browser-reg] 密码后 URL: {page.url[:120]}")
 
             # [4] Turnstile / hCaptcha 等待（Camoufox 指纹通常可自动通过）
             logger.info("[browser-reg] 等待反欺诈检查 ...")
+            _capture_step("anti_fraud_wait_start")
             for wait_i in range(30):
                 time.sleep(1)
                 cur = page.url
+                _raise_if_auth_error("anti-fraud-wait")
                 # 到达 OTP 输入或继续步骤 → 通过
                 if _has_otp_inputs():
                     logger.info(f"[browser-reg] 已到达 OTP 页面")
+                    _capture_step("anti_fraud_reached_otp")
                     break
                 if "chatgpt.com" in cur and "auth.openai.com" not in cur:
                     logger.info(f"[browser-reg] 已直接登录到 chatgpt.com")
+                    _capture_step("anti_fraud_direct_chatgpt")
                     break
                 if wait_i == 15:
-                    page.screenshot(path="/tmp/browser_reg_wait15.png")
+                    _capture_step("anti_fraud_wait_15s")
                     logger.info(f"[browser-reg] 15s 等待中: {cur[:80]}")
 
             # [5] OTP 步骤
             otp_completed = False
             if _has_otp_inputs():
                 otp_sent_at = time.time()
+                _capture_step("otp_page_ready")
                 otp_completed = _fill_otp_if_present("OTP", issued_after=otp_sent_at)
 
             # [6] /about-you：Full name + Age（单框）
             logger.info(f"[browser-reg] OTP 后 URL: {page.url[:120]}")
+            _capture_step("after_otp_url")
             time.sleep(5)  # 等重定向到 /about-you
             logger.info(f"[browser-reg] 稳定后 URL: {page.url[:120]}")
+            _capture_step("after_otp_stabilized")
 
             # 等 /about-you 表单加载完成。先等 URL 稳定
             for _ in range(20):
@@ -526,6 +664,7 @@ def browser_register(cfg, mail_provider) -> dict:
             birthday_input = None
             birthday_meta = None
             for attempt in range(30):
+                _raise_if_auth_error("about-you-wait")
                 metas = _enum_inputs()
                 visible_metas = [m for m in metas if m["visible"]
                                   and m["type"] not in ("hidden","submit","button",
@@ -561,7 +700,7 @@ def browser_register(cfg, mail_provider) -> dict:
                 if "chatgpt.com" in page.url and "auth" not in page.url:
                     break
                 if attempt == 5:
-                    page.screenshot(path="/tmp/browser_reg_about_you_wait.png")
+                    _capture_step("about_you_wait_5s")
                     logger.info(f"[browser-reg] 等待 about-you 输入框 5s, URL={page.url[:100]} "
                                 f"inputs visible={len(visible_metas)}")
                 time.sleep(1)
@@ -597,7 +736,7 @@ def browser_register(cfg, mail_provider) -> dict:
                     logger.info("[browser-reg] about-you 走 placeholder/aria fallback 命中")
 
             if full_name_input and birthday_input:
-                page.screenshot(path="/tmp/browser_reg_about_you.png")
+                _capture_step("about_you_form_ready")
                 full_name = f"{first_name} {last_name}"
                 # Birthday：26-40 岁之间的 1 月 15 日（足够>18，固定日期便于一致指纹）
                 import datetime as _dt
@@ -618,6 +757,7 @@ def browser_register(cfg, mail_provider) -> dict:
                         full_name_input.fill(full_name)
                     except Exception:
                         page.keyboard.type(full_name, delay=random.randint(30, 80))
+                    _capture_step("about_you_name_filled")
                     time.sleep(random.uniform(0.4, 0.9))
                     birthday_input.focus(); time.sleep(0.3)
                     # 先清空（预填可能有今日日期）
@@ -644,6 +784,7 @@ def browser_register(cfg, mail_provider) -> dict:
                                 birthday_input.fill(legacy_age)
                             except Exception:
                                 page.keyboard.type(legacy_age, delay=random.randint(40, 100))
+                    _capture_step("about_you_birthday_filled")
                     time.sleep(random.uniform(0.4, 0.9))
                     clicked = False
                     for sel in ['button:has-text("Finish")', 'button:has-text("Create")',
@@ -654,14 +795,15 @@ def browser_register(cfg, mail_provider) -> dict:
                             b.click()
                             clicked = True
                             logger.info(f"[browser-reg] 点击 about-you 继续: {sel}")
+                            _capture_step("about_you_continue_clicked")
                             break
                     if not clicked:
-                        page.screenshot(path="/tmp/browser_reg_no_finish_btn.png")
+                        _capture_step("about_you_no_finish_button")
                 except Exception as e:
                     logger.warning(f"[browser-reg] about-you 填写异常: {e}")
-                    page.screenshot(path="/tmp/browser_reg_name_fail.png")
+                    _capture_step("about_you_fill_exception")
             else:
-                page.screenshot(path="/tmp/browser_reg_no_name_form.png")
+                _capture_step("about_you_no_form")
                 logger.warning(f"[browser-reg] 未找到 about-you 表单，URL={page.url[:120]}")
 
             # [7] 等待回到 chatgpt.com (可能有中间页如 email-verification / success-page)
@@ -672,18 +814,21 @@ def browser_register(cfg, mail_provider) -> dict:
             for i in range(120):
                 time.sleep(1)
                 cur = page.url
+                _raise_if_auth_error("chatgpt-return-wait")
                 if cur != last_url:
                     logger.info(f"[browser-reg] URL@{i}s: {cur[:120]}")
+                    _capture_step(f"return_url_change_{i}s")
                     last_url = cur
                 if "email-verification" in cur and _has_otp_inputs() and otp_completed:
                     if stuck_email_verification_since is None:
                         stuck_email_verification_since = i
                     if i - stuck_email_verification_since in (5, 15):
                         logger.info("[browser-reg] OTP 后仍在 email-verification，重试提交当前页面")
+                        _capture_step("return_email_verification_stuck_retry")
                         _retry_current_otp_submit("email-verification重试")
                         continue
                     if i - stuck_email_verification_since > 30:
-                        page.screenshot(path="/tmp/browser_reg_otp_stuck.png")
+                        _capture_step("return_otp_stuck")
                         raise RuntimeError(
                             f"OTP 提交后仍停在 email-verification，当前: {page.url[:120]}"
                         )
@@ -701,6 +846,7 @@ def browser_register(cfg, mail_provider) -> dict:
                         if info and info > 100:
                             arrived = True
                             logger.info(f"[browser-reg] 到达 + session accessToken 长度={info}")
+                            _capture_step("chatgpt_session_ready")
                             break
                     except Exception:
                         pass
@@ -722,12 +868,13 @@ def browser_register(cfg, mail_provider) -> dict:
                         # 页面导航时 context destroyed，忽略
                         pass
             if not arrived:
-                page.screenshot(path="/tmp/browser_reg_no_chatgpt.png")
+                _capture_step("no_chatgpt_return")
                 raise RuntimeError(f"未跳转回 chatgpt.com，当前: {page.url[:120]}")
 
             # [8] 等 JS 初始化完成，取 access_token
             time.sleep(5)
             logger.info("[browser-reg] 拉取 /api/auth/session ...")
+            _capture_step("before_session_fetch")
             session_info = page.evaluate('''async () => {
                 const r = await fetch("/api/auth/session", {credentials: "include"});
                 return await r.json();
@@ -735,6 +882,7 @@ def browser_register(cfg, mail_provider) -> dict:
             result["access_token"] = session_info.get("accessToken", "")
             result["id_token"] = session_info.get("idToken", "") if isinstance(session_info, dict) else ""
             logger.info(f"[browser-reg] access_token 长度: {len(result['access_token'])}")
+            _capture_step("after_session_fetch")
 
             # [9] 提取 cookies
             all_cookies = ctx.cookies()
@@ -754,6 +902,7 @@ def browser_register(cfg, mail_provider) -> dict:
                 f"[browser-reg] session_token={'yes' if result['session_token'] else 'no'} "
                 f"device_id={result['device_id'][:16]}..."
             )
+            _capture_step("cookies_extracted")
 
             # [10] Codex OAuth 获取 refresh_token
             # 已知限制: signup 完成后 auth.openai.com 的 hydra session 无法给 Codex 换 token
@@ -789,6 +938,7 @@ def browser_register(cfg, mail_provider) -> dict:
                     }
                     auth_url = f"https://auth.openai.com/oauth/authorize?{urlencode(auth_params)}"
                     logger.info("[browser-reg] Codex OAuth 获取 refresh_token ...")
+                    _capture_step("codex_oauth_before")
                     # 真浏览器 goto + route 拦截 localhost
                     cb_url = ""
                     callback_holder = {"url": ""}
@@ -812,6 +962,7 @@ def browser_register(cfg, mail_provider) -> dict:
                         page.goto(auth_url, wait_until="commit", timeout=30000)
                     except Exception as e_nav:
                         logger.info(f"[browser-reg] Codex goto: {str(e_nav)[:120]}")
+                    _capture_step("codex_oauth_after_goto")
 
                     for _ in range(30):
                         if callback_holder["url"]:
@@ -830,6 +981,7 @@ def browser_register(cfg, mail_provider) -> dict:
 
                     cb_url = callback_holder["url"]
                     logger.info(f"[browser-reg] Codex callback URL: {cb_url[:150] if cb_url else '<空>'}")
+                    _capture_step("codex_oauth_callback_state")
                     if not cb_url:
                         logger.info(f"[browser-reg] 当前 page.url: {page.url[:200]}")
                     if cb_url:
@@ -877,7 +1029,7 @@ def browser_register(cfg, mail_provider) -> dict:
                     logger.warning(f"[browser-reg] Codex OAuth 异常: {e_codex}")
 
             if not result["access_token"] or not result["session_token"]:
-                page.screenshot(path="/tmp/browser_reg_missing_token.png")
+                _capture_step("missing_token")
                 raise RuntimeError(
                     f"缺少凭证: access_token={bool(result['access_token'])} "
                     f"session_token={bool(result['session_token'])}"

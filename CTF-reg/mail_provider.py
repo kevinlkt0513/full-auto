@@ -4,7 +4,9 @@
 """
 import email
 import email.message
+import fcntl
 import imaplib
+import json
 import random
 import re
 import string
@@ -13,7 +15,8 @@ import logging
 import os
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -23,15 +26,81 @@ class MailProvider:
     _GLOBAL_CONSUMED_UIDS: dict[str, set[int]] = {}
 
     def __init__(self, imap_server: str, imap_port: int, email_addr: str, auth_code: str,
-                 catch_all_domain: str = ""):
+                 catch_all_domain: str = "", email_pool: list[str] | None = None,
+                 email_pool_file: str = "", email_pool_state_path: str = "",
+                 email_pool_reuse: bool = False):
         self.imap_server = imap_server
         self.imap_port = imap_port
         self.email_addr = email_addr
         self.auth_code = auth_code
         self.catch_all_domain = catch_all_domain
+        self.email_pool = self._load_email_pool(email_pool or [], email_pool_file)
+        self.email_pool_file = email_pool_file
+        self.email_pool_state_path = email_pool_state_path
+        self.email_pool_reuse = self._as_bool(email_pool_reuse)
+        self._email_pool_index = 0
         # 跨多次 wait_for_otp（含新建实例）保留“已消费”消息 UID，避免重复读取旧验证码
         global_key = f"{imap_server}:{imap_port}:{email_addr}".lower()
         self._consumed_uids = self._GLOBAL_CONSUMED_UIDS.setdefault(global_key, set())
+
+    @classmethod
+    def from_config(cls, mail_cfg) -> "MailProvider":
+        """从 Config.mail 构造，兼容新增邮箱池字段。"""
+        return cls(
+            mail_cfg.imap_server,
+            mail_cfg.imap_port,
+            mail_cfg.email,
+            mail_cfg.auth_code,
+            mail_cfg.catch_all_domain,
+            getattr(mail_cfg, "email_pool", []) or [],
+            getattr(mail_cfg, "email_pool_file", "") or "",
+            getattr(mail_cfg, "email_pool_state_path", "") or "",
+            getattr(mail_cfg, "email_pool_reuse", False),
+        )
+
+    @staticmethod
+    def _as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _is_valid_email_addr(addr: str) -> bool:
+        return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", addr or ""))
+
+    @classmethod
+    def _load_email_pool(cls, inline_pool: list[str], pool_file: str) -> list[str]:
+        """加载并去重邮箱池，保留输入顺序。"""
+        raw_items: list[str] = []
+        for item in inline_pool or []:
+            if item is not None:
+                raw_items.append(str(item).strip())
+
+        if pool_file:
+            path = Path(pool_file).expanduser()
+            try:
+                for raw in path.read_text(encoding="utf-8").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    line = re.split(r"\s+#", line, maxsplit=1)[0].strip()
+                    if line:
+                        raw_items.append(line)
+            except FileNotFoundError:
+                raise FileNotFoundError(f"邮箱池文件不存在: {pool_file}")
+
+        pool: list[str] = []
+        seen: set[str] = set()
+        for addr in raw_items:
+            key = addr.lower()
+            if not cls._is_valid_email_addr(addr):
+                raise ValueError(f"邮箱池包含无效地址: {addr!r}")
+            if key not in seen:
+                seen.add(key)
+                pool.append(addr)
+        return pool
 
     def _connect(self) -> imaplib.IMAP4_SSL:
         """建立 IMAP 连接并登录"""
@@ -52,6 +121,54 @@ class MailProvider:
         letters2 = "".join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
         return letters1 + numbers + letters2
 
+    def _claim_email_from_memory_pool(self) -> str:
+        if self._email_pool_index >= len(self.email_pool):
+            if not self.email_pool_reuse:
+                raise RuntimeError("邮箱池已耗尽，请补充 email_pool/email_pool_file 或启用 email_pool_reuse")
+            self._email_pool_index = 0
+        addr = self.email_pool[self._email_pool_index]
+        self._email_pool_index += 1
+        return addr
+
+    def _claim_email_from_state_pool(self) -> str:
+        state_path = Path(self.email_pool_state_path).expanduser()
+        if state_path.parent:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+        with open(lock_path, "a+", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                state = {}
+                if state_path.exists():
+                    try:
+                        state = json.loads(state_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        logger.warning(f"邮箱池状态文件损坏，重置: {state_path}")
+                        state = {}
+                index = int(state.get("next_index", 0) or 0)
+                if index >= len(self.email_pool):
+                    if not self.email_pool_reuse:
+                        raise RuntimeError(f"邮箱池已耗尽: {state_path}")
+                    index = 0
+                addr = self.email_pool[index]
+                next_state = {
+                    "next_index": index + 1,
+                    "pool_size": len(self.email_pool),
+                    "last_email": addr,
+                    "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                }
+                tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+                tmp_path.write_text(json.dumps(next_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                os.replace(tmp_path, state_path)
+                return addr
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    def _claim_email_from_pool(self) -> str:
+        if self.email_pool_state_path:
+            return self._claim_email_from_state_pool()
+        return self._claim_email_from_memory_pool()
+
     def create_mailbox(self) -> str:
         """生成随机 catch-all 邮箱地址，或复用指定邮箱"""
         # 如果设置了 _reuse_email，复用它
@@ -59,6 +176,11 @@ class MailProvider:
             addr = self._reuse_email
             self._reuse_email = None  # 只复用一次
             logger.info(f"复用邮箱: {addr}")
+            return addr
+
+        if self.email_pool:
+            addr = self._claim_email_from_pool()
+            logger.info(f"使用邮箱池地址: {addr} (IMAP 收件: {self.email_addr})")
             return addr
 
         conn = self._connect()

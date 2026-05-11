@@ -20,6 +20,19 @@ class ProxyInput(BaseModel):
     expected_country: str | None = None
 
 
+def _normalize_proxy_url(url: str) -> str:
+    raw = (url or "").strip()
+    try:
+        pp = urlparse(raw)
+    except ValueError:
+        return raw
+    if not pp.netloc or not pp.username or pp.password is not None or "@" not in pp.username:
+        return raw
+    userinfo, hostinfo = pp.netloc.rsplit("@", 1)
+    username, password = userinfo.split("@", 1)
+    return pp._replace(netloc=f"{username}:{password}@{hostinfo}").geturl()
+
+
 def _is_socks5_with_auth(url: str) -> bool:
     pp = urlparse(url)
     return pp.scheme in ("socks5", "socks5h") and bool(pp.username)
@@ -61,13 +74,23 @@ def _spawn_gost_relay(upstream_url: str, listen_port: int) -> tuple[bool, str]:
     return False, f"gost 4s 内未监听 :{listen_port}，见 {log_path}"
 
 
+def _fetch_exit_ip(proxy_url: str) -> str:
+    with httpx.Client(proxy=proxy_url, timeout=15.0) as c:
+        return c.get("https://api.ipify.org").text.strip()
+
+
+def _fetch_geo(ip: str) -> dict:
+    with httpx.Client(timeout=10.0) as c:
+        return c.get(f"http://ip-api.com/json/{ip}").json()
+
+
 def check(body: dict) -> PreflightResult:
     cfg = ProxyInput.model_validate(body)
     if cfg.mode == "none":
         return aggregate([CheckResult(name="proxy", status="ok",
                                       message="no proxy configured")])
 
-    proxy_url = cfg.url
+    proxy_url = _normalize_proxy_url(cfg.url or "")
     if not proxy_url:
         return aggregate([CheckResult(name="proxy", status="fail",
                                       message="proxy url required for mode=" + cfg.mode)])
@@ -76,8 +99,7 @@ def check(body: dict) -> PreflightResult:
 
     # 直连上游：先确认 proxy 本身能用
     try:
-        with httpx.Client(proxy=proxy_url, timeout=15.0) as c:
-            ip = c.get("https://api.ipify.org").text.strip()
+        ip = _fetch_exit_ip(proxy_url)
     except Exception as e:
         return aggregate([CheckResult(name="connect", status="fail",
                                       message=f"proxy connect failed: {e}")])
@@ -85,8 +107,7 @@ def check(body: dict) -> PreflightResult:
 
     # 国家检测
     try:
-        with httpx.Client(timeout=10.0) as c:
-            geo = c.get(f"http://ip-api.com/json/{ip}").json()
+        geo = _fetch_geo(ip)
         country = geo.get("countryCode")
         country_name = geo.get("country")
         msg = f"{country} ({country_name})"

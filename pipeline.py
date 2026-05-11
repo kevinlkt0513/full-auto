@@ -23,11 +23,13 @@ Pipeline 调度器：注册 ChatGPT 账号 → Stripe/PayPal 支付
 import argparse
 import json
 import os
+import queue
 import random
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -563,7 +565,25 @@ class RegistrationError(RuntimeError):
     pass
 
 
-def register(cardw_config_path, proxy=None, python="python3", timeout=600, browser: bool = True):
+def _compact_registration_error_for_record(error, limit: int = 500) -> str:
+    """Keep the beginning and actionable tail of long registration errors."""
+    text = str(error)
+    if len(text) <= limit:
+        return text
+    marker = "\n...\n"
+    if limit <= len(marker) + 2:
+        return text[:limit]
+    head_len = min(180, max(1, limit // 3))
+    tail_len = max(1, limit - head_len - len(marker))
+    return f"{text[:head_len].rstrip()}{marker}{text[-tail_len:].lstrip()}"
+
+
+def _registration_error_status(error, prefix: str = "", limit: int = 500) -> str:
+    remaining = max(1, limit - len(prefix))
+    return f"{prefix}{_compact_registration_error_for_record(error, remaining)}"
+
+
+def register(cardw_config_path, proxy=None, python=None, timeout=600, browser: bool = True):
     """注册一个新 ChatGPT 账号。
 
     browser=True 时走 Camoufox 真浏览器注册流程（Turnstile 真实执行，避免账号被风控）。
@@ -571,6 +591,7 @@ def register(cardw_config_path, proxy=None, python="python3", timeout=600, brows
 
     返回 dict: {email, session_token, access_token, device_id, ...}
     """
+    python = python or sys.executable
     cardw_config_path = str(Path(cardw_config_path).resolve())
     auth_bundle_dir = str(CARDW_DIR)
 
@@ -585,7 +606,7 @@ from mail_provider import MailProvider
 from browser_register import browser_register
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
-mail = MailProvider(cfg.mail.imap_server, cfg.mail.imap_port, cfg.mail.email, cfg.mail.auth_code, cfg.mail.catch_all_domain)
+mail = MailProvider.from_config(cfg.mail)
 result = browser_register(cfg, mail)
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
 """
@@ -600,7 +621,7 @@ from auth_flow import AuthFlow
 from mail_provider import MailProvider
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
-mail = MailProvider(cfg.mail.imap_server, cfg.mail.imap_port, cfg.mail.email, cfg.mail.auth_code, cfg.mail.catch_all_domain)
+mail = MailProvider.from_config(cfg.mail)
 flow = AuthFlow(cfg)
 result = flow.run_register(mail)
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False), flush=True)
@@ -626,20 +647,48 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
 
     result_json = None
     lines = []
+    output_queue = queue.Queue()
+
+    def _drain_stdout():
+        try:
+            if proc.stdout is None:
+                return
+            for out_line in proc.stdout:
+                output_queue.put(out_line)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=_drain_stdout, daemon=True)
+    reader.start()
+    reader_done = False
+
     try:
         deadline = time.time() + timeout
-        for line in proc.stdout:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                proc.kill()
+                raise RegistrationError("注册超时")
+            try:
+                line = output_queue.get(timeout=min(0.2, remaining))
+            except queue.Empty:
+                if proc.poll() is not None and reader_done:
+                    break
+                continue
+            if line is None:
+                reader_done = True
+                if proc.poll() is not None:
+                    break
+                continue
             line = line.rstrip("\n")
             lines.append(line)
             print(f"  [reg] {line}")
             if line.startswith("LOCALAUTH_RESULT_JSON="):
                 payload = line.split("=", 1)[1]
                 result_json = json.loads(payload)
-            if time.time() > deadline:
-                proc.kill()
-                raise RegistrationError("注册超时")
     finally:
         proc.wait()
+        reader.join(timeout=1)
 
     if proc.returncode != 0 and result_json is None:
         last_lines = "\n".join(lines[-5:])
@@ -677,7 +726,7 @@ class DatadomeSliderError(PaymentError):
 
 def pay(card_config_path, session_token=None, access_token=None,
         device_id=None, use_paypal=False, use_gopay=False,
-        gopay_otp_file=None, python="python3", timeout=600):
+        gopay_otp_file=None, python=None, timeout=600):
     """执行 Stripe 支付流程。
 
     use_paypal / use_gopay 互斥：默认 card 路径，paypal 走 PayPal browser，
@@ -689,6 +738,7 @@ def pay(card_config_path, session_token=None, access_token=None,
     if use_paypal and use_gopay:
         raise PaymentError("use_paypal 与 use_gopay 互斥")
 
+    python = python or sys.executable
     card_config_path = str(Path(card_config_path).resolve())
 
     # 如果有外部凭证，创建临时配置
@@ -839,7 +889,10 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
             reg = register(effective_cardw, timeout=timeout_reg)
             record["registration"] = {"status": "ok", "email": reg.get("email", "")}
         except RegistrationError as e:
-            record["registration"] = {"status": "error", "error": str(e)[:200]}
+            record["registration"] = {
+                "status": "error",
+                "error": _compact_registration_error_for_record(e),
+            }
             record["payment"] = {"status": "skipped"}
             _append_result(record)
             raise
@@ -914,7 +967,11 @@ def _run_one(args_tuple):
         r["batch_index"] = idx
         return r
     except Exception as e:
-        return {"batch_index": idx, "status": "error", "error": str(e)[:200]}
+        return {
+            "batch_index": idx,
+            "status": "error",
+            "error": _compact_registration_error_for_record(e),
+        }
 
 
 def _run_one_pay_only(args_tuple):
@@ -942,7 +999,12 @@ def _register_one(args_tuple):
         r = register(effective)
         return {"index": idx, "status": "ok", "picked_domain": picked_domain, **r}
     except Exception as e:
-        return {"index": idx, "status": "error", "picked_domain": picked_domain, "error": str(e)[:200]}
+        return {
+            "index": idx,
+            "status": "error",
+            "picked_domain": picked_domain,
+            "error": _compact_registration_error_for_record(e),
+        }
     finally:
         if temp_cardw and os.path.exists(temp_cardw):
             try: os.unlink(temp_cardw)
@@ -1573,7 +1635,7 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
             # - InvalidIP / geoip / proxy 脱链 等基础设施类 → 不计 zone streak
             state["total_failed"] += 1
             state["consecutive_failures"] += 1
-            state["last_error"] = f"reg: {str(e)[:160]}"
+            state["last_error"] = _registration_error_status(e, prefix="reg: ")
             perm = "-"
             err_low = str(e).lower()
             is_infra = any(k in err_low for k in (
@@ -2159,7 +2221,7 @@ def _augment_card_result_last_match(email, session_id, extra_fields):
 # 复用现成：register / pay / _exchange_refresh_token_with_session / _cpa_import_after_team
 # ──────────────────────────────────────────────
 
-_OAI_CODEX_CLIENT_ID = "YOUR_OPENAI_CODEX_CLIENT_ID"
+_OAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 
 def _oai_exchange_refresh_to_access_token(refresh_token: str,
@@ -2303,7 +2365,7 @@ def _cpa_import_after_team(email: str, sid: str, cpa_cfg: dict) -> str:
         return "no_rt"
 
     # 刷一次 refresh_token → 拿绑了 team 的 access_token + id_token
-    client_id = cpa_cfg.get("oauth_client_id", "YOUR_OPENAI_CODEX_CLIENT_ID")
+    client_id = (cpa_cfg.get("oauth_client_id") or _OAI_CODEX_CLIENT_ID).strip()
     at, id_tok, account_id = "", "", ""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走本地 proxy
     try:
@@ -2563,7 +2625,7 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
                 reg = register(effective_cardw, timeout=timeout_reg)
             except Exception as e:
                 print(f"[self-dealer] ✗ member {i} 注册失败: {e}")
-                entry["status"] = f"register_error: {str(e)[:120]}"
+                entry["status"] = _registration_error_status(e, prefix="register_error: ")
                 continue
             finally:
                 if temp_cardw and os.path.exists(temp_cardw):
