@@ -12,6 +12,14 @@ CTF-pay/paypal_cf_persist.bak_*/
 
 # 运行时产物（账号凭证 / 支付结果 / 日志 / 域池状态 / CF API token）
 output/
+logs/
+.codex/
+
+# 本地环境和 dotenv 配置
+.venv/
+.env
+.env.*
+!.env.example
 
 # 用户实际配置（保留 *.example.json，忽略实际填写过的）
 CTF-pay/config.paypal.json
